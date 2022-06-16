@@ -1,4 +1,4 @@
-# ETH.STORE
+![image](https://user-images.githubusercontent.com/26490734/174131682-598758e0-1b5d-4b8d-8995-26cab3f65f22.png)
 
 The Transparent Ethereum Staking Reward Reference Rate represents the average rate of return per effectively staked Ether on Ethereum on a given day.
 
