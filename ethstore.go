@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
+	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
+	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
@@ -23,25 +26,27 @@ var timeout = time.Second * 120
 var timeoutMu = sync.Mutex{}
 
 type Day struct {
-	Day              uint64          `json:"day"`
-	DayTime          time.Time       `json:"dayTime"`
-	Apr              decimal.Decimal `json:"apr"`
-	Validators       uint64          `json:"validators"`
-	StartEpoch       phase0.Epoch    `json:"startEpoch"`
-	EffectiveBalance phase0.Gwei     `json:"effectiveBalance"`
-	StartBalance     phase0.Gwei     `json:"startBalance"`
-	EndBalance       phase0.Gwei     `json:"endBalance"`
-	DepositsSum      phase0.Gwei     `json:"depositsSum"`
-	ValidatorSets    map[string]*Day `json:"validatorSets"`
+	Day                  uint64          `json:"day"`
+	DayTime              time.Time       `json:"dayTime"`
+	Apr                  decimal.Decimal `json:"apr"`
+	Validators           uint64          `json:"validators"`
+	StartEpoch           phase0.Epoch    `json:"startEpoch"`
+	EffectiveBalanceGwei phase0.Gwei     `json:"effectiveBalance"`
+	StartBalanceGwei     phase0.Gwei     `json:"startBalance"`
+	EndBalanceGwei       phase0.Gwei     `json:"endBalance"`
+	DepositsSumGwei      phase0.Gwei     `json:"depositsSum"`
+	TxFeesSumWei         *big.Int        `json:"txFeesSum"`
+	ValidatorSets        map[string]*Day `json:"validatorSets"`
 }
 
 type Validator struct {
-	Index            phase0.ValidatorIndex
-	Pubkey           phase0.BLSPubKey
-	EffectiveBalance phase0.Gwei
-	StartBalance     phase0.Gwei
-	EndBalance       phase0.Gwei
-	DepositsSum      phase0.Gwei
+	Index                phase0.ValidatorIndex
+	Pubkey               phase0.BLSPubKey
+	EffectiveBalanceGwei phase0.Gwei
+	StartBalanceGwei     phase0.Gwei
+	EndBalanceGwei       phase0.Gwei
+	DepositsSumGwei      phase0.Gwei
+	TxFeesSumWei         *big.Int
 }
 
 func SetDebugLevel(lvl uint64) {
@@ -148,10 +153,11 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 			continue
 		}
 		v := &Validator{
-			Index:            val.Index,
-			Pubkey:           val.Validator.PublicKey,
-			EffectiveBalance: val.Validator.EffectiveBalance,
-			EndBalance:       val.Balance,
+			Index:                val.Index,
+			Pubkey:               val.Validator.PublicKey,
+			EffectiveBalanceGwei: val.Validator.EffectiveBalance,
+			EndBalanceGwei:       val.Balance,
+			TxFeesSumWei:         new(big.Int),
 		}
 		validatorsByIndex[val.Index] = v
 		validatorsByPubkey[val.Validator.PublicKey] = v
@@ -166,24 +172,20 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 		if !exists {
 			continue
 		}
-		v.StartBalance = bal
+		v.StartBalanceGwei = bal
 	}
 
 	g := new(errgroup.Group)
-	maxRoutinesGuard := make(chan int, 10) // max 10 routines at a time
+	g.SetLimit(10)
 	validatorsMu := sync.Mutex{}
 
-	// get all deposits of all active validators in the slot interval [firstSlotOfCurrentDay,lastSlotOfCurrentDay)
+	// get all deposits and txs of all active validators in the slot interval [firstSlotOfCurrentDay,lastSlotOfCurrentDay)
 	for i := firstSlotOfCurrentDay; i < lastSlotOfCurrentDay; i++ {
-		maxRoutinesGuard <- 1
 		i := i
 		if GetDebugLevel() > 0 && (lastSlotOfCurrentDay-i)%1000 == 0 {
-			log.Printf("DEBUG eth.store: checking blocks for deposits: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlotOfCurrentDay)/float64(lastSlotOfCurrentDay-firstSlotOfCurrentDay), i, firstSlotOfCurrentDay, lastSlotOfCurrentDay)
+			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlotOfCurrentDay)/float64(lastSlotOfCurrentDay-firstSlotOfCurrentDay), i, firstSlotOfCurrentDay, lastSlotOfCurrentDay)
 		}
 		g.Go(func() error {
-			defer func() {
-				<-maxRoutinesGuard
-			}()
 			block, err := client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
 			if err != nil {
 				return err
@@ -192,19 +194,40 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 				return nil
 			}
 			var deposits []*phase0.Deposit
+			var exec *bellatrix.ExecutionPayload
+			var proposerIndex phase0.ValidatorIndex
 			switch block.Version {
 			case spec.DataVersionPhase0:
 				deposits = block.Phase0.Message.Body.Deposits
+				proposerIndex = block.Phase0.Message.ProposerIndex
 			case spec.DataVersionAltair:
 				deposits = block.Altair.Message.Body.Deposits
+				proposerIndex = block.Altair.Message.ProposerIndex
 			case spec.DataVersionBellatrix:
 				deposits = block.Bellatrix.Message.Body.Deposits
+				proposerIndex = block.Bellatrix.Message.ProposerIndex
+				exec = block.Bellatrix.Message.Body.ExecutionPayload
 			default:
 				return fmt.Errorf("unknown block version for block %v: %v", i, block.Version)
 			}
 
 			validatorsMu.Lock()
 			defer validatorsMu.Unlock()
+
+			if exec != nil {
+				v, exists := validatorsByIndex[proposerIndex]
+				if exists {
+					for _, tx := range exec.Transactions {
+						var decTx gethTypes.Transaction
+						err := decTx.UnmarshalBinary([]byte(tx))
+						if err != nil {
+							return err
+						}
+						txFee := new(big.Int).Mul(decTx.GasPrice(), new(big.Int).SetUint64(decTx.Gas()))
+						v.TxFeesSumWei.Add(v.TxFeesSumWei, txFee)
+					}
+				}
+			}
 
 			for _, d := range deposits {
 				v, exists := validatorsByPubkey[d.Data.PublicKey]
@@ -214,7 +237,7 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 				if GetDebugLevel() > 0 {
 					log.Printf("DEBUG eth.store: extra deposit at block %d from %v: %#x: %v\n", i, v.Index, d.Data.PublicKey, d.Data.Amount)
 				}
-				v.DepositsSum += d.Data.Amount
+				v.DepositsSumGwei += d.Data.Amount
 			}
 
 			return nil
@@ -224,19 +247,22 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 		return nil, err
 	}
 
-	var totalEffectiveBalance phase0.Gwei
-	var totalStartBalance phase0.Gwei
-	var totalEndBalance phase0.Gwei
-	var totalDepositsSum phase0.Gwei
+	var totalEffectiveBalanceGwei phase0.Gwei
+	var totalStartBalanceGwei phase0.Gwei
+	var totalEndBalanceGwei phase0.Gwei
+	var totalDepositsSumGwei phase0.Gwei
+	totalTxFeesSumWei := new(big.Int)
 	validatorSetDays := map[string]*Day{}
 	for name := range validatorSets {
 		validatorSetDays[name] = &Day{}
+		validatorSetDays[name].TxFeesSumWei = new(big.Int)
 	}
 	for _, v := range validatorsByIndex {
-		totalEffectiveBalance += v.EffectiveBalance
-		totalStartBalance += v.StartBalance
-		totalEndBalance += v.EndBalance
-		totalDepositsSum += v.DepositsSum
+		totalEffectiveBalanceGwei += v.EffectiveBalanceGwei
+		totalStartBalanceGwei += v.StartBalanceGwei
+		totalEndBalanceGwei += v.EndBalanceGwei
+		totalDepositsSumGwei += v.DepositsSumGwei
+		totalTxFeesSumWei.Add(totalTxFeesSumWei, v.TxFeesSumWei)
 
 		for name, set := range validatorSets {
 			if _, exists := set[v.Index]; exists {
@@ -244,32 +270,36 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 				validatorSetDays[name].DayTime = dayTime
 				validatorSetDays[name].StartEpoch = phase0.Epoch(firstEpochOfCurrentDay)
 				validatorSetDays[name].Validators++
-				validatorSetDays[name].EffectiveBalance += v.EffectiveBalance
-				validatorSetDays[name].StartBalance += v.StartBalance
-				validatorSetDays[name].EndBalance += v.EndBalance
-				validatorSetDays[name].DepositsSum += v.DepositsSum
+				validatorSetDays[name].EffectiveBalanceGwei += v.EffectiveBalanceGwei
+				validatorSetDays[name].StartBalanceGwei += v.StartBalanceGwei
+				validatorSetDays[name].EndBalanceGwei += v.EndBalanceGwei
+				validatorSetDays[name].DepositsSumGwei += v.DepositsSumGwei
+				validatorSetDays[name].TxFeesSumWei.Add(validatorSetDays[name].TxFeesSumWei, v.TxFeesSumWei)
 			}
 		}
 	}
 
 	for _, set := range validatorSetDays {
-		setConsensusRewards := int64(set.EndBalance) - int64(set.StartBalance) - int64(set.DepositsSum)
-		set.Apr = decimal.NewFromInt(365).Mul(decimal.NewFromInt(setConsensusRewards)).Div(decimal.NewFromInt(int64(set.EffectiveBalance)))
+		setConsensusRewardsGwei := int64(set.EndBalanceGwei) - int64(set.StartBalanceGwei) - int64(set.DepositsSumGwei)
+		setTotalRewardsWei := decimal.NewFromBigInt(set.TxFeesSumWei, 0).Add(decimal.NewFromInt(setConsensusRewardsGwei).Mul(decimal.NewFromInt(1e9)))
+		set.Apr = decimal.NewFromInt(365).Mul(setTotalRewardsWei).Div(decimal.NewFromInt(int64(set.EffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9)))
 	}
 
-	totalConsensusRewards := int64(totalEndBalance) - int64(totalStartBalance) - int64(totalDepositsSum)
+	totalConsensusRewardsGwei := int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei)
+	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 0).Add(decimal.NewFromInt(totalConsensusRewardsGwei).Mul(decimal.NewFromInt(1e9)))
 
 	ethstoreDay := &Day{
-		Day:              day,
-		DayTime:          dayTime,
-		StartEpoch:       phase0.Epoch(firstEpochOfCurrentDay),
-		Apr:              decimal.NewFromInt(365).Mul(decimal.NewFromInt(totalConsensusRewards)).Div(decimal.NewFromInt(int64(totalEffectiveBalance))),
-		Validators:       uint64(len(validatorsByIndex)),
-		EffectiveBalance: totalEffectiveBalance,
-		StartBalance:     totalStartBalance,
-		EndBalance:       totalEndBalance,
-		DepositsSum:      totalDepositsSum,
-		ValidatorSets:    validatorSetDays,
+		Day:                  day,
+		DayTime:              dayTime,
+		StartEpoch:           phase0.Epoch(firstEpochOfCurrentDay),
+		Apr:                  decimal.NewFromInt(365).Mul(totalRewardsWei).Div(decimal.NewFromInt(int64(totalEffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
+		Validators:           uint64(len(validatorsByIndex)),
+		EffectiveBalanceGwei: totalEffectiveBalanceGwei,
+		StartBalanceGwei:     totalStartBalanceGwei,
+		EndBalanceGwei:       totalEndBalanceGwei,
+		DepositsSumGwei:      totalDepositsSumGwei,
+		TxFeesSumWei:         totalTxFeesSumWei,
+		ValidatorSets:        validatorSetDays,
 	}
 
 	if GetDebugLevel() > 0 {

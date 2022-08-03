@@ -102,7 +102,7 @@ func calculate(dayStr string, validatorSets map[string][]uint64) {
 		fmt.Printf("%s\n", data)
 		return
 	}
-	fmt.Printf("day: %v (epoch %v, %v), network.apr: %v", ethstoreDay.Day, ethstoreDay.StartEpoch, ethstoreDay.DayTime, ethstoreDay.Apr.StringFixed(8))
+	fmt.Printf("day: %v (epoch %v, %v), network.apr: %v", ethstoreDay.Day, ethstoreDay.StartEpoch, ethstoreDay.DayTime, ethstoreDay.Apr.StringFixed(9))
 	for name, set := range ethstoreDay.ValidatorSets {
 		fmt.Printf(", %s.apr: %v (%v vs network)", name, set.Apr.StringFixed(8), set.Apr.Div(ethstoreDay.Apr).StringFixed(2))
 	}
