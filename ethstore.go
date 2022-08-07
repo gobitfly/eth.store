@@ -149,7 +149,7 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 		if uint64(val.Validator.ActivationEpoch) > firstEpochOfCurrentDay {
 			continue
 		}
-		if uint64(val.Validator.ExitEpoch) <= lastEpochOfCurrentDay {
+		if uint64(val.Validator.ExitEpoch) < lastEpochOfCurrentDay {
 			continue
 		}
 		v := &Validator{
