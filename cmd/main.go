@@ -3,15 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	ethstore "github.com/gobitfly/eth.store"
 	"github.com/gobitfly/eth.store/version"
+	"github.com/shopspring/decimal"
 )
 
 var opts struct {
@@ -20,6 +25,7 @@ var opts struct {
 	ApiAddress string
 	ApiTimeout time.Duration
 	Json       bool
+	JsonFile   string
 	DebugLevel uint64
 	Version    bool
 }
@@ -30,6 +36,7 @@ func main() {
 	flag.StringVar(&opts.ApiAddress, "api.address", "http://localhost:4000", "address of the conensus-node-api")
 	flag.DurationVar(&opts.ApiTimeout, "api.timeout", time.Second*120, "timeout duration for the consensus-node-api")
 	flag.BoolVar(&opts.Json, "json", false, "format output as json")
+	flag.StringVar(&opts.JsonFile, "json.file", "", "path to file to write results into, only missing days will be added")
 	flag.Uint64Var(&opts.DebugLevel, "debug", 0, "set debug-level (higher level will increase verbosity)")
 	flag.BoolVar(&opts.Version, "version", false, "print version and exit")
 	flag.Parse()
@@ -42,25 +49,10 @@ func main() {
 	ethstore.SetApiTimeout(opts.ApiTimeout)
 	ethstore.SetDebugLevel(opts.DebugLevel)
 
-	validatorSets := map[string][]uint64{}
-	if opts.Validators != "" {
-		splitSemicolon := strings.Split(opts.Validators, ";")
-		for _, s := range splitSemicolon {
-			splitDoublecolon := strings.Split(s, ":")
-			if len(splitDoublecolon) != 2 {
-				log.Fatalf("error parsing validators-flag")
-			}
-			set := []uint64{}
-			splitComma := strings.Split(splitDoublecolon[1], ",")
-			for _, ss := range splitComma {
-				idx, err := strconv.ParseUint(ss, 10, 64)
-				if err != nil {
-					log.Fatalf("error parsing validators-flag: %v", err)
-				}
-				set = append(set, idx)
-			}
-			validatorSets[splitDoublecolon[0]] = set
-		}
+	days := []uint64{}
+
+	if opts.Days == "all" {
+		opts.Days = "0-latest"
 	}
 
 	if strings.ContainsAny(opts.Days, "-") {
@@ -69,42 +61,109 @@ func main() {
 		if err != nil {
 			log.Fatalf("error parsing days-flag: %v", err)
 		}
-		toDay, err := strconv.ParseUint(daysSplit[1], 10, 64)
-		if err != nil {
-			log.Fatalf("error parsing days-flag: %v", err)
+		var toDay uint64
+		if daysSplit[1] == "latest" {
+			d, err := ethstore.GetLatestDay(context.Background(), opts.ApiAddress)
+			if err != nil {
+				log.Fatalf("error getting lattest day: %v", err)
+			}
+			toDay = d
+		} else {
+			d, err := strconv.ParseUint(daysSplit[1], 10, 64)
+			if err != nil {
+				log.Fatalf("error parsing days-flag: %v", err)
+			}
+			toDay = d
 		}
 		if toDay < fromDay {
 			log.Fatalf("error parsing days-flag: toDay < fromDay")
 		}
 		for i := fromDay; i <= toDay; i++ {
-			calculate(fmt.Sprintf("%d", i), validatorSets)
+			days = append(days, i)
 		}
 	} else if strings.ContainsAny(opts.Days, ",") {
-		daysSplit := strings.Split(opts.Days, ",")
-		for _, dayStr := range daysSplit {
-			calculate(dayStr, validatorSets)
+		s := strings.Split(opts.Days, ",")
+		for _, d := range s {
+			di, err := strconv.ParseUint(d, 10, 64)
+			if err != nil {
+				log.Fatalf("error parsing days-flag: %v", err)
+			}
+			days = append(days, di)
+		}
+	} else if opts.Days == "latest" {
+		d, err := ethstore.GetLatestDay(context.Background(), opts.ApiAddress)
+		if err != nil {
+			log.Fatalf("error getting lattest day: %v", err)
+		}
+		days = []uint64{d}
+	} else {
+		d, err := strconv.ParseUint(opts.Days, 10, 64)
+		if err != nil {
+			log.Fatalf("error parsing days-flag: %v", err)
+		}
+		days = []uint64{d}
+	}
+
+	if opts.JsonFile != "" {
+		fileDays := []*ethstore.Day{}
+		_, err := os.Stat(opts.JsonFile)
+		if err == nil {
+			fileDaysBytes, err := ioutil.ReadFile(opts.JsonFile)
+			if err != nil {
+				log.Fatalf("error reading file: %v", err)
+			}
+			err = json.Unmarshal(fileDaysBytes, &fileDays)
+			if err != nil {
+				log.Fatalf("error parsing file: %v", err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.Fatalf("error reading file: %v", err)
+		}
+
+		fileDaysMap := map[uint64]*ethstore.Day{}
+		for _, d := range fileDays {
+			fileDaysMap[d.Day] = d
+		}
+		for _, d := range days {
+			if _, exists := fileDaysMap[d]; exists {
+				continue
+			}
+			ethstoreDay, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", d))
+			if err != nil {
+				log.Fatalf("error calculating ethstore: %v", err)
+			}
+			fileDays = append(fileDays, ethstoreDay)
+			sort.SliceStable(fileDays, func(i, j int) bool {
+				return fileDays[i].Day < fileDays[j].Day
+			})
+			fileDaysBytes, err := json.MarshalIndent(&fileDays, "", "\t")
+			if err != nil {
+				log.Fatalf("error marshaling ethstore: %v", err)
+			}
+			err = ioutil.WriteFile(opts.JsonFile, fileDaysBytes, 0644)
+			if err != nil {
+				log.Fatalf("error writing ethstore to file: %v", err)
+			}
 		}
 	} else {
-		calculate(opts.Days, validatorSets)
-	}
-}
-
-func calculate(dayStr string, validatorSets map[string][]uint64) {
-	ethstoreDay, err := ethstore.Calculate(context.Background(), opts.ApiAddress, dayStr, validatorSets)
-	if err != nil {
-		log.Fatalf("error calculating ethstore: %v", err)
-	}
-	if opts.Json {
-		data, err := json.Marshal(ethstoreDay)
-		if err != nil {
-			log.Fatalf("error marshaling json: %v", err)
+		result := []*ethstore.Day{}
+		for _, d := range days {
+			ethstoreDay, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", d))
+			if err != nil {
+				log.Fatalf("error calculating ethstore: %v", err)
+			}
+			result = append(result, ethstoreDay)
 		}
-		fmt.Printf("%s\n", data)
-		return
+		if opts.Json {
+			daysBytes, err := json.MarshalIndent(&result, "", "\t")
+			if err != nil {
+				log.Fatalf("error marshaling ethstore: %v", err)
+			}
+			fmt.Println(daysBytes)
+		} else {
+			for _, d := range result {
+				fmt.Printf("day: %v (%v), epochs: %v-%v, validators: %v, apr: %v, effectiveBalanceSumGwei: %v, totalRewardsSumWei: %v, consensusRewardsGwei: %v (%s), txFeesSumWei: %v\n", d.Day, d.DayTime, d.StartEpoch, d.StartEpoch+224, d.Validators, d.Apr.StringFixed(9), d.EffectiveBalanceGwei, d.TotalRewardsWei, d.ConsensusRewardsGwei, d.ConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)).Div(d.TotalRewardsWei), d.TxFeesSumWei)
+			}
+		}
 	}
-	fmt.Printf("day: %v (epoch %v, %v), network.apr: %v", ethstoreDay.Day, ethstoreDay.StartEpoch, ethstoreDay.DayTime, ethstoreDay.Apr.StringFixed(9))
-	for name, set := range ethstoreDay.ValidatorSets {
-		fmt.Printf(", %s.apr: %v (%v vs network)", name, set.Apr.StringFixed(8), set.Apr.Div(ethstoreDay.Apr).StringFixed(2))
-	}
-	fmt.Printf("\n")
 }

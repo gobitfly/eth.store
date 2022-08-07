@@ -20,7 +20,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var client *http.Service
 var debugLevel = uint64(0)
 var timeout = time.Second * 120
 var timeoutMu = sync.Mutex{}
@@ -31,12 +30,13 @@ type Day struct {
 	Apr                  decimal.Decimal `json:"apr"`
 	Validators           uint64          `json:"validators"`
 	StartEpoch           phase0.Epoch    `json:"startEpoch"`
-	EffectiveBalanceGwei phase0.Gwei     `json:"effectiveBalance"`
-	StartBalanceGwei     phase0.Gwei     `json:"startBalance"`
-	EndBalanceGwei       phase0.Gwei     `json:"endBalance"`
-	DepositsSumGwei      phase0.Gwei     `json:"depositsSum"`
-	TxFeesSumWei         *big.Int        `json:"txFeesSum"`
-	ValidatorSets        map[string]*Day `json:"validatorSets"`
+	EffectiveBalanceGwei decimal.Decimal `json:"effectiveBalanceGwei"`
+	StartBalanceGwei     decimal.Decimal `json:"startBalanceGwei"`
+	EndBalanceGwei       decimal.Decimal `json:"endBalanceGwei"`
+	DepositsSumGwei      decimal.Decimal `json:"depositsSumGwei"`
+	ConsensusRewardsGwei decimal.Decimal `json:"consensusRewardsGwei"`
+	TxFeesSumWei         decimal.Decimal `json:"txFeesSumWei"`
+	TotalRewardsWei      decimal.Decimal `json:"totalRewardsWei"`
 }
 
 type Validator struct {
@@ -69,20 +69,42 @@ func GetApiTimeout() time.Duration {
 	return timeout
 }
 
-func Calculate(ctx context.Context, address string, dayStr string, validatorSetsStr map[string][]uint64) (*Day, error) {
+func GetLatestDay(ctx context.Context, address string) (uint64, error) {
+	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetApiTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	if err != nil {
+		return 0, err
+	}
+	client := service.(*http.Service)
+	apiSpec, err := client.Spec(ctx)
+	if err != nil {
+		return 0, err
+	}
+	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	if !exists {
+		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
+	}
+	secondsPerSlotDur, ok := secondsPerSlotIf.(time.Duration)
+	if !ok {
+		return 0, fmt.Errorf("invalid format of SECONDS_PER_SLOT in spec")
+	}
+	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
+	slotsPerDay := 3600 * 24 / secondsPerSlot
+
+	bbh, err := client.BeaconBlockHeader(ctx, "finalized")
+	if err != nil {
+		return 0, err
+	}
+
+	day := uint64(bbh.Header.Message.Slot)/slotsPerDay - 1
+	return day, nil
+}
+
+func Calculate(ctx context.Context, address string, dayStr string) (*Day, error) {
 	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetApiTimeout()), http.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return nil, err
 	}
 	client := service.(*http.Service)
-
-	validatorSets := map[string]map[phase0.ValidatorIndex]bool{}
-	for name, m := range validatorSetsStr {
-		validatorSets[name] = map[phase0.ValidatorIndex]bool{}
-		for _, idx := range m {
-			validatorSets[name][phase0.ValidatorIndex(idx)] = true
-		}
-	}
 
 	apiSpec, err := client.Spec(ctx)
 	if err != nil {
@@ -252,41 +274,17 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 	var totalEndBalanceGwei phase0.Gwei
 	var totalDepositsSumGwei phase0.Gwei
 	totalTxFeesSumWei := new(big.Int)
-	validatorSetDays := map[string]*Day{}
-	for name := range validatorSets {
-		validatorSetDays[name] = &Day{}
-		validatorSetDays[name].TxFeesSumWei = new(big.Int)
-	}
+
 	for _, v := range validatorsByIndex {
 		totalEffectiveBalanceGwei += v.EffectiveBalanceGwei
 		totalStartBalanceGwei += v.StartBalanceGwei
 		totalEndBalanceGwei += v.EndBalanceGwei
 		totalDepositsSumGwei += v.DepositsSumGwei
 		totalTxFeesSumWei.Add(totalTxFeesSumWei, v.TxFeesSumWei)
-
-		for name, set := range validatorSets {
-			if _, exists := set[v.Index]; exists {
-				validatorSetDays[name].Day = day
-				validatorSetDays[name].DayTime = dayTime
-				validatorSetDays[name].StartEpoch = phase0.Epoch(firstEpochOfCurrentDay)
-				validatorSetDays[name].Validators++
-				validatorSetDays[name].EffectiveBalanceGwei += v.EffectiveBalanceGwei
-				validatorSetDays[name].StartBalanceGwei += v.StartBalanceGwei
-				validatorSetDays[name].EndBalanceGwei += v.EndBalanceGwei
-				validatorSetDays[name].DepositsSumGwei += v.DepositsSumGwei
-				validatorSetDays[name].TxFeesSumWei.Add(validatorSetDays[name].TxFeesSumWei, v.TxFeesSumWei)
-			}
-		}
 	}
 
-	for _, set := range validatorSetDays {
-		setConsensusRewardsGwei := int64(set.EndBalanceGwei) - int64(set.StartBalanceGwei) - int64(set.DepositsSumGwei)
-		setTotalRewardsWei := decimal.NewFromBigInt(set.TxFeesSumWei, 0).Add(decimal.NewFromInt(setConsensusRewardsGwei).Mul(decimal.NewFromInt(1e9)))
-		set.Apr = decimal.NewFromInt(365).Mul(setTotalRewardsWei).Div(decimal.NewFromInt(int64(set.EffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9)))
-	}
-
-	totalConsensusRewardsGwei := int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei)
-	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 0).Add(decimal.NewFromInt(totalConsensusRewardsGwei).Mul(decimal.NewFromInt(1e9)))
+	totalConsensusRewardsGwei := decimal.NewFromInt(int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei))
+	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 1).Add(totalConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
 
 	ethstoreDay := &Day{
 		Day:                  day,
@@ -294,19 +292,17 @@ func Calculate(ctx context.Context, address string, dayStr string, validatorSets
 		StartEpoch:           phase0.Epoch(firstEpochOfCurrentDay),
 		Apr:                  decimal.NewFromInt(365).Mul(totalRewardsWei).Div(decimal.NewFromInt(int64(totalEffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
 		Validators:           uint64(len(validatorsByIndex)),
-		EffectiveBalanceGwei: totalEffectiveBalanceGwei,
-		StartBalanceGwei:     totalStartBalanceGwei,
-		EndBalanceGwei:       totalEndBalanceGwei,
-		DepositsSumGwei:      totalDepositsSumGwei,
-		TxFeesSumWei:         totalTxFeesSumWei,
-		ValidatorSets:        validatorSetDays,
+		EffectiveBalanceGwei: decimal.NewFromInt(int64(totalEffectiveBalanceGwei)),
+		StartBalanceGwei:     decimal.NewFromInt(int64(totalStartBalanceGwei)),
+		EndBalanceGwei:       decimal.NewFromInt(int64(totalEndBalanceGwei)),
+		DepositsSumGwei:      decimal.NewFromInt(int64(totalDepositsSumGwei)),
+		TxFeesSumWei:         decimal.NewFromBigInt(totalTxFeesSumWei, 1),
+		ConsensusRewardsGwei: totalConsensusRewardsGwei,
+		TotalRewardsWei:      totalRewardsWei,
 	}
 
 	if GetDebugLevel() > 0 {
-		fmt.Printf("DEBUG eth.store: %+v\n", ethstoreDay)
-		for name, set := range validatorSetDays {
-			fmt.Printf("DEBUG eth.store: %v: %+v\n", name, set)
-		}
+		log.Printf("DEBUG eth.store: %+v\n", ethstoreDay)
 	}
 
 	return ethstoreDay, nil
