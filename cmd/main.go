@@ -32,7 +32,6 @@ var opts struct {
 
 func main() {
 	flag.StringVar(&opts.Days, "days", "", "days to calculate eth.store for, format: \"1-3\" or \"1,4,6\"")
-	flag.StringVar(&opts.Validators, "validators", "", "validator-sets to compare ethstore with, format: \"<validatorSetName>:<validatorIndex>,..;..\"")
 	flag.StringVar(&opts.ApiAddress, "api.address", "http://localhost:4000", "address of the conensus-node-api")
 	flag.DurationVar(&opts.ApiTimeout, "api.timeout", time.Second*120, "timeout duration for the consensus-node-api")
 	flag.BoolVar(&opts.Json, "json", false, "format output as json")
