@@ -22,8 +22,6 @@ Usage of bin/eth.store:
     	format output as json
   -json.file string
     	path to file to write results into, only missing days will be added
-  -validators string
-    	validator-sets to compare ethstore with, format: "<validatorSetName>:<validatorIndex>,..;.."
   -version
     	print version and exit
 
