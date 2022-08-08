@@ -7,6 +7,7 @@ ETH.STORE (Ether Staking Offered Rate) represents the average financial return v
 ```bash
 # build and install binary from source via go
 go install github.com/gobitfly/eth.store
+
 eth.store -h
 Usage of bin/eth.store:
   -api.address string
@@ -25,12 +26,13 @@ Usage of bin/eth.store:
     	validator-sets to compare ethstore with, format: "<validatorSetName>:<validatorIndex>,..;.."
   -version
     	print version and exit
+
 eth.store -api.address="http://some-beacon-node:4000" -days="497-499"
 day: 497 (2022-04-12 12:00:23 +0000 UTC), epochs: 111825-112049, validators: 341373, apr: 0.049083890, effectiveBalanceSumGwei: 10923834000000000, totalRewardsSumWei: 1468997980817000000000, consensusRewardsGwei: 1468997980817 (100%), txFeesSumWei: 0
 day: 498 (2022-04-13 12:00:23 +0000 UTC), epochs: 112050-112274, validators: 342498, apr: 0.049011013, effectiveBalanceSumGwei: 10959834000000000, totalRewardsSumWei: 1471650879693000000000, consensusRewardsGwei: 1471650879693 (100%), txFeesSumWei: 0
 day: 499 (2022-04-14 12:00:23 +0000 UTC), epochs: 112275-112499, validators: 343623, apr: 0.048898885, effectiveBalanceSumGwei: 10995834000000000, totalRewardsSumWei: 1473106903824000000000, consensusRewardsGwei: 1473106903824 (100%), txFeesSumWei: 0
 
-# build and run docker-image
+# build and run docker-image and output json
 git clone github.com/gobitfly/eth.store
 cd eth.store
 docker build . -t eth.store
@@ -66,10 +68,11 @@ docker run --network=host eth.store -api.address="http://some-beacon-node:4000" 
 	}
 ]
 
-# use pre-built docker-image
+# use pre-built docker-image and write into json-file
 docker run --network=host gobitfly/eth.store:latest -api.address="http://some-beacon-node:4000" -days="finalized" -json.file="./ethstore.json"
-day: 613 (epoch 125775, 2022-06-13 12:00:23 +0000 UTC), network.apr: 0.04504914, myValidators.apr: 0.03851903 (0.86 vs network), otherValidators.apr: 0.03842060 (0.85 vs network)
-
+day: 613 (2022-08-06 12:00:23 +0000 UTC), epochs: 137925-138149, validators: 412063, apr: 0.044632337, effectiveBalanceSumGwei: 13185905000000000, totalRewardsSumWei: 1612377406889000000000, consensusRewardsGwei: 1612377406889 (100%), txFeesSumWei: 0
+cat ./etsthore.json
+[
 	{
 		"day": 613,
 		"dayTime": "2022-08-06T12:00:23Z",
