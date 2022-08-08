@@ -61,7 +61,7 @@ func main() {
 			log.Fatalf("error parsing days-flag: %v", err)
 		}
 		var toDay uint64
-		if daysSplit[1] == "latest" {
+		if daysSplit[1] == "latest" || daysSplit[1] == "finalized" {
 			d, err := ethstore.GetLatestDay(context.Background(), opts.ApiAddress)
 			if err != nil {
 				log.Fatalf("error getting lattest day: %v", err)
@@ -89,7 +89,7 @@ func main() {
 			}
 			days = append(days, di)
 		}
-	} else if opts.Days == "latest" {
+	} else if opts.Days == "latest" || opts.Days == "finalized" {
 		d, err := ethstore.GetLatestDay(context.Background(), opts.ApiAddress)
 		if err != nil {
 			log.Fatalf("error getting lattest day: %v", err)
@@ -123,46 +123,53 @@ func main() {
 		for _, d := range fileDays {
 			fileDaysMap[d.Day] = d
 		}
-		for _, d := range days {
-			if _, exists := fileDaysMap[d]; exists {
+		for _, dd := range days {
+			if d, exists := fileDaysMap[dd]; exists {
+				logEthstoreDay(d)
 				continue
 			}
-			ethstoreDay, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", d))
+			d, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", dd))
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
-			fileDays = append(fileDays, ethstoreDay)
+			fileDays = append(fileDays, d)
 			sort.SliceStable(fileDays, func(i, j int) bool {
 				return fileDays[i].Day < fileDays[j].Day
 			})
-			fileDaysBytes, err := json.MarshalIndent(&fileDays, "", "\t")
+			fileDaysJson, err := json.MarshalIndent(&fileDays, "", "\t")
 			if err != nil {
 				log.Fatalf("error marshaling ethstore: %v", err)
 			}
-			err = ioutil.WriteFile(opts.JsonFile, fileDaysBytes, 0644)
+			err = ioutil.WriteFile(opts.JsonFile, fileDaysJson, 0644)
 			if err != nil {
 				log.Fatalf("error writing ethstore to file: %v", err)
+			}
+			if !opts.Json {
+				logEthstoreDay(d)
 			}
 		}
 	} else {
 		result := []*ethstore.Day{}
-		for _, d := range days {
-			ethstoreDay, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", d))
+		for _, dd := range days {
+			d, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", dd))
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
-			result = append(result, ethstoreDay)
+			result = append(result, d)
+			if !opts.Json {
+				logEthstoreDay(d)
+			}
 		}
 		if opts.Json {
-			daysBytes, err := json.MarshalIndent(&result, "", "\t")
+			daysJson, err := json.MarshalIndent(&result, "", "\t")
 			if err != nil {
 				log.Fatalf("error marshaling ethstore: %v", err)
 			}
-			fmt.Println(daysBytes)
-		} else {
-			for _, d := range result {
-				fmt.Printf("day: %v (%v), epochs: %v-%v, validators: %v, apr: %v, effectiveBalanceSumGwei: %v, totalRewardsSumWei: %v, consensusRewardsGwei: %v (%s), txFeesSumWei: %v\n", d.Day, d.DayTime, d.StartEpoch, d.StartEpoch+224, d.Validators, d.Apr.StringFixed(9), d.EffectiveBalanceGwei, d.TotalRewardsWei, d.ConsensusRewardsGwei, d.ConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)).Div(d.TotalRewardsWei), d.TxFeesSumWei)
-			}
+			fmt.Printf("%s\n", daysJson)
 		}
 	}
+}
+
+func logEthstoreDay(d *ethstore.Day) {
+	fmt.Printf("day: %v (%v), epochs: %v-%v, validators: %v, apr: %v, effectiveBalanceSumGwei: %v, totalRewardsSumWei: %v, consensusRewardsGwei: %v (%s%%), txFeesSumWei: %v\n", d.Day, d.DayTime, d.StartEpoch, d.StartEpoch+224, d.Validators, d.Apr.StringFixed(9), d.EffectiveBalanceGwei, d.TotalRewardsWei, d.ConsensusRewardsGwei, d.ConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9*1e2)).Div(d.TotalRewardsWei), d.TxFeesSumWei)
 }
