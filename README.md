@@ -39,11 +39,11 @@ docker build . -t eth.store
 docker run --network=host eth.store -api.address="http://some-beacon-node:4000" -days="0,10" -json
 [
 	{
-		"day": 0,
+		"day": "0",
 		"dayTime": "2020-12-01T12:00:23Z",
 		"apr": "0.1740251707100836",
-		"validators": 21062,
-		"startEpoch": 0,
+		"validators": "21062",
+		"startEpoch": "0",
 		"effectiveBalanceGwei": "673984000000000",
 		"startBalanceGwei": "674112000000000",
 		"endBalanceGwei": "674433342960701",
@@ -53,11 +53,11 @@ docker run --network=host eth.store -api.address="http://some-beacon-node:4000" 
 		"totalRewardsWei": "321342960701000000000"
 	},
 	{
-		"day": 10,
+		"day": "10",
 		"dayTime": "2020-12-11T12:00:23Z",
 		"apr": "0.1622832991187628",
-		"validators": 29871,
-		"startEpoch": 2250,
+		"validators": "29871",
+		"startEpoch": "2250",
 		"effectiveBalanceGwei": "955872000000000",
 		"startBalanceGwei": "960110038369385",
 		"endBalanceGwei": "960535030319235",
@@ -69,16 +69,16 @@ docker run --network=host eth.store -api.address="http://some-beacon-node:4000" 
 ]
 
 # use pre-built docker-image and write into json-file
-docker run --network=host gobitfly/eth.store:latest -api.address="http://some-beacon-node:4000" -days="finalized" -json.file="./ethstore.json"
+docker run --network=host gobitfly/eth.store:latest -api.address="http://some-beacon-node:4000" -days="613" -json.file="./ethstore.json"
 day: 613 (2022-08-06 12:00:23 +0000 UTC), epochs: 137925-138149, validators: 412063, apr: 0.044632337, effectiveBalanceSumGwei: 13185905000000000, totalRewardsSumWei: 1612377406889000000000, consensusRewardsGwei: 1612377406889 (100%), txFeesSumWei: 0
 cat ./etsthore.json
 [
 	{
-		"day": 613,
+		"day": "613",
 		"dayTime": "2022-08-06T12:00:23Z",
 		"apr": "0.0446323368410803",
-		"validators": 412063,
-		"startEpoch": 137925,
+		"validators": "412063",
+		"startEpoch": "137925",
 		"effectiveBalanceGwei": "13185905000000000",
 		"startBalanceGwei": "13899169115750451",
 		"endBalanceGwei": "13900781493157340",

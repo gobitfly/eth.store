@@ -121,7 +121,7 @@ func main() {
 
 		fileDaysMap := map[uint64]*ethstore.Day{}
 		for _, d := range fileDays {
-			fileDaysMap[d.Day] = d
+			fileDaysMap[d.Day.BigInt().Uint64()] = d
 		}
 		for _, dd := range days {
 			if d, exists := fileDaysMap[dd]; exists {
@@ -134,7 +134,7 @@ func main() {
 			}
 			fileDays = append(fileDays, d)
 			sort.SliceStable(fileDays, func(i, j int) bool {
-				return fileDays[i].Day < fileDays[j].Day
+				return fileDays[i].Day.Cmp(fileDays[j].Day) < 1
 			})
 			fileDaysJson, err := json.MarshalIndent(&fileDays, "", "\t")
 			if err != nil {
@@ -171,5 +171,5 @@ func main() {
 }
 
 func logEthstoreDay(d *ethstore.Day) {
-	fmt.Printf("day: %v (%v), epochs: %v-%v, validators: %v, apr: %v, effectiveBalanceSumGwei: %v, totalRewardsSumWei: %v, consensusRewardsGwei: %v (%s%%), txFeesSumWei: %v\n", d.Day, d.DayTime, d.StartEpoch, d.StartEpoch+224, d.Validators, d.Apr.StringFixed(9), d.EffectiveBalanceGwei, d.TotalRewardsWei, d.ConsensusRewardsGwei, d.ConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9*1e2)).Div(d.TotalRewardsWei), d.TxFeesSumWei)
+	fmt.Printf("day: %v (%v), epochs: %v-%v, validators: %v, apr: %v, effectiveBalanceSumGwei: %v, totalRewardsSumWei: %v, consensusRewardsGwei: %v (%s%%), txFeesSumWei: %v\n", d.Day, d.DayTime, d.StartEpoch, d.StartEpoch.Add(decimal.New(224, 0)), d.Validators, d.Apr.StringFixed(9), d.EffectiveBalanceGwei, d.TotalRewardsWei, d.ConsensusRewardsGwei, d.ConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9*1e2)).Div(d.TotalRewardsWei).StringFixed(2), d.TxFeesSumWei)
 }

@@ -25,11 +25,11 @@ var timeout = time.Second * 120
 var timeoutMu = sync.Mutex{}
 
 type Day struct {
-	Day                  uint64          `json:"day"`
+	Day                  decimal.Decimal `json:"day"`
 	DayTime              time.Time       `json:"dayTime"`
 	Apr                  decimal.Decimal `json:"apr"`
-	Validators           uint64          `json:"validators"`
-	StartEpoch           phase0.Epoch    `json:"startEpoch"`
+	Validators           decimal.Decimal `json:"validators"`
+	StartEpoch           decimal.Decimal `json:"startEpoch"`
 	EffectiveBalanceGwei decimal.Decimal `json:"effectiveBalanceGwei"`
 	StartBalanceGwei     decimal.Decimal `json:"startBalanceGwei"`
 	EndBalanceGwei       decimal.Decimal `json:"endBalanceGwei"`
@@ -292,11 +292,11 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 0).Add(totalConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
 
 	ethstoreDay := &Day{
-		Day:                  day,
+		Day:                  decimal.NewFromInt(int64(day)),
 		DayTime:              dayTime,
-		StartEpoch:           phase0.Epoch(firstEpochOfCurrentDay),
+		StartEpoch:           decimal.NewFromInt(int64(firstEpochOfCurrentDay)),
 		Apr:                  decimal.NewFromInt(365).Mul(totalRewardsWei).Div(decimal.NewFromInt(int64(totalEffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
-		Validators:           uint64(len(validatorsByIndex)),
+		Validators:           decimal.NewFromInt(int64(len(validatorsByIndex))),
 		EffectiveBalanceGwei: decimal.NewFromInt(int64(totalEffectiveBalanceGwei)),
 		StartBalanceGwei:     decimal.NewFromInt(int64(totalStartBalanceGwei)),
 		EndBalanceGwei:       decimal.NewFromInt(int64(totalEndBalanceGwei)),
