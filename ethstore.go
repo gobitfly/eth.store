@@ -145,14 +145,13 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 		}
 	}
 	firstSlotOfCurrentDay := day * slotsPerDay
-	lastSlotOfCurrentDay := (day+1)*slotsPerDay - 1
 	firstSlotOfNextDay := (day + 1) * slotsPerDay
 	firstEpochOfCurrentDay := firstSlotOfCurrentDay / slotsPerEpoch
-	lastEpochOfCurrentDay := lastSlotOfCurrentDay / slotsPerEpoch
+	firstEpochOfNextDay := firstSlotOfNextDay / slotsPerEpoch
 
 	genesis, err := client.GenesisTime(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error getting genesisTime: %w", err)
 	}
 	dayTime := time.Unix(genesis.Unix()+int64(firstSlotOfCurrentDay)*int64(secondsPerSlot), 0)
 
@@ -163,54 +162,58 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 	validatorsByIndex := map[phase0.ValidatorIndex]*Validator{}
 	validatorsByPubkey := map[phase0.BLSPubKey]*Validator{}
 
-	allValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlotOfNextDay), nil)
+	startValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlotOfCurrentDay), nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error getting startValidators for firstSlotOfCurrentDay %d: %w", firstSlotOfCurrentDay, err)
 	}
-	for _, val := range allValidators {
-		if uint64(val.Validator.ActivationEpoch) > firstEpochOfCurrentDay {
+	for _, val := range startValidators {
+		if !val.Status.IsActive() {
 			continue
 		}
-		if uint64(val.Validator.ExitEpoch) < lastEpochOfCurrentDay {
-			continue
-		}
-		v := &Validator{
+		vv := &Validator{
 			Index:                val.Index,
 			Pubkey:               val.Validator.PublicKey,
 			EffectiveBalanceGwei: val.Validator.EffectiveBalance,
-			EndBalanceGwei:       val.Balance,
+			StartBalanceGwei:     val.Balance,
 			TxFeesSumWei:         new(big.Int),
 		}
-		validatorsByIndex[val.Index] = v
-		validatorsByPubkey[val.Validator.PublicKey] = v
+		validatorsByIndex[val.Index] = vv
+		validatorsByPubkey[val.Validator.PublicKey] = vv
 	}
 
-	startBalances, err := client.ValidatorBalances(ctx, fmt.Sprintf("%d", firstSlotOfCurrentDay), nil)
+	endValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlotOfNextDay), nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error getting endValidators for firstSlotOfNextDay %d: %w", firstSlotOfCurrentDay, err)
 	}
-	for idx, bal := range startBalances {
-		v, exists := validatorsByIndex[idx]
+	for _, val := range endValidators {
+		v, exists := validatorsByIndex[val.Index]
 		if !exists {
 			continue
 		}
-		v.StartBalanceGwei = bal
+		if uint64(val.Validator.ExitEpoch) < firstEpochOfNextDay {
+			// do not account validators that have not been active until the end of the day
+			delete(validatorsByIndex, val.Index)
+			delete(validatorsByPubkey, val.Validator.PublicKey)
+			continue
+		}
+		// set endBalance of validator to the balance of the first epoch of the next day
+		v.EndBalanceGwei = val.Balance
 	}
 
 	g := new(errgroup.Group)
 	g.SetLimit(10)
 	validatorsMu := sync.Mutex{}
 
-	// get all deposits and txs of all active validators in the slot interval [firstSlotOfCurrentDay,lastSlotOfCurrentDay)
-	for i := firstSlotOfCurrentDay; i < lastSlotOfCurrentDay; i++ {
+	// get all deposits and txs of all active validators in the slot interval [firstSlotOfCurrentDay,firstSlotOfNextDay)
+	for i := firstSlotOfCurrentDay; i < firstSlotOfNextDay; i++ {
 		i := i
-		if GetDebugLevel() > 0 && (lastSlotOfCurrentDay-i)%1000 == 0 {
-			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlotOfCurrentDay)/float64(lastSlotOfCurrentDay-firstSlotOfCurrentDay), i, firstSlotOfCurrentDay, lastSlotOfCurrentDay)
+		if GetDebugLevel() > 0 && (firstSlotOfNextDay-i)%1000 == 0 {
+			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlotOfCurrentDay)/float64(firstSlotOfNextDay-firstSlotOfCurrentDay), i, firstSlotOfCurrentDay, firstSlotOfNextDay)
 		}
 		g.Go(func() error {
 			block, err := client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
 			if err != nil {
-				return err
+				return fmt.Errorf("error getting block %v: %w", i, err)
 			}
 			if block == nil {
 				return nil
@@ -239,6 +242,7 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 			if exec != nil {
 				v, exists := validatorsByIndex[proposerIndex]
 				if exists {
+					// only add tx fees of blocks that have been proposed from validators that have been active the whole day
 					for _, tx := range exec.Transactions {
 						var decTx gethTypes.Transaction
 						err := decTx.UnmarshalBinary([]byte(tx))
@@ -254,6 +258,7 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 			for _, d := range deposits {
 				v, exists := validatorsByPubkey[d.Data.PublicKey]
 				if !exists {
+					// only add deposits of validators that have been active the whole day
 					continue
 				}
 				if GetDebugLevel() > 0 {
@@ -284,7 +289,7 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 	}
 
 	totalConsensusRewardsGwei := decimal.NewFromInt(int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei))
-	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 1).Add(totalConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
+	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 0).Add(totalConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
 
 	ethstoreDay := &Day{
 		Day:                  day,
@@ -296,7 +301,7 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 		StartBalanceGwei:     decimal.NewFromInt(int64(totalStartBalanceGwei)),
 		EndBalanceGwei:       decimal.NewFromInt(int64(totalEndBalanceGwei)),
 		DepositsSumGwei:      decimal.NewFromInt(int64(totalDepositsSumGwei)),
-		TxFeesSumWei:         decimal.NewFromBigInt(totalTxFeesSumWei, 1),
+		TxFeesSumWei:         decimal.NewFromBigInt(totalTxFeesSumWei, 0),
 		ConsensusRewardsGwei: totalConsensusRewardsGwei,
 		TotalRewardsWei:      totalRewardsWei,
 	}
