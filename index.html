@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>ETH.STORE</title>
+<style>
+body {background:#f1852c;color:white;font-family:Barlow,sans-serif;margin:auto;display:block;text-align: center;}
+.chart {margin:40px;background:white;}
+.responsive {max-width: 100%; display: block; height: auto; margin: auto}
+p {margin:40px;}
+</style>
+</head>
+<img class="responsive" src="https://user-images.githubusercontent.com/26490734/174131682-598758e0-1b5d-4b8d-8995-26cab3f65f22.png">
+<p>ETH.STORE (Ether Staking Offered Rate) represents the average financial return validators on the Ethereum network have achieved in a 24-hour period. See the <a href="https://github.com/gobitfly/eth.store">GitHub-Repository</a> for more information.</p>
+<canvas id="chart-mainnet" class="chart"></canvas>
+<canvas id="chart-goerli" class="chart"></canvas>
+<canvas id="chart-sepolia" class="chart"></canvas>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+<script>
+drawChart("mainnet")
+drawChart("goerli")
+drawChart("sepolia")
+async function drawChart(network) {
+    var el = document.getElementById('chart-'+network)
+    el.style.display = 'none' // hide the chart until it is rendered to reduce containers jumping arround
+    const response = await fetch('data/ethstore.'+network+'.json')
+    var data = await response.json()
+    var labels = []
+    var apr = []
+    var consensusRewardsGwei = []
+    var execRewardsGwei = []
+    for (i = 0; i < data.length; i++) {
+        labels.push(data[i].dayTime.substring(0,10))
+        apr.push(data[i].apr*100)
+        consensusRewardsGwei.push(Number(data[i].consensusRewardsGwei)/1e9)
+        execRewardsGwei.push(Number(BigInt(data[i].txFeesSumWei))/1e18)
+    }
+    const mixedChart = new Chart(el, { 
+        data: { 
+            datasets: [ 
+                { type: 'line', label: 'apr', data: apr, backgroundColor: '#cc65fe', order: 1, yAxsisID: 'y', }, 
+                { type: 'bar', label: 'consensus', data: consensusRewardsGwei, backgroundColor: '#ff6384', order: 2, yAxisID: 'y1', }, 
+                { type: 'bar', label: 'execution', data: execRewardsGwei, backgroundColor: '#36a2eb', order: 2, yAxisID: 'y1', }, 
+            ], 
+            labels: labels,
+        }, 
+        options: {
+            plugins: { 
+                title: { display: true, text: 'ETH.STORE '+network },
+                tooltip: { callbacks: { 
+                    afterTitle: (tooltipItems) => ["day: "+data[tooltipItems[0].dataIndex].day,"epoch: "+data[tooltipItems[0].dataIndex].startEpoch,"validators: "+data[tooltipItems[0].dataIndex].validators,"eligible: "+Number(data[tooltipItems[0].dataIndex].effectiveBalanceGwei)/1e9+" ETH"]
+                } },
+            },
+            interaction: { mode: 'index', intersect: false, },
+            legend: { display: true },
+            scales:{
+                y: { id: 'left', title: { display:true, text: "APR (%)"}, type: 'linear', position: 'left' },
+                y1: { id: 'right', title: { display:true, text: "Rewards (ETH)"}, type: 'linear', position: 'right' }, 
+            },
+        } 
+    })
+    el.style.display = 'block' // show the chart once it is rendered
+}
+</script>
+</html>
