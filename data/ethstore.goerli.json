@@ -7072,7 +7072,7 @@
 	{
 		"day": "505",
 		"dayTime": "2022-08-10T14:00:00Z",
-		"apr": "0.3164404410511112",
+		"apr": "0.0251658412729891",
 		"validators": "368679",
 		"startEpoch": "113625",
 		"effectiveBalanceGwei": "11780777000000000",
@@ -7080,7 +7080,63 @@
 		"endBalanceGwei": "12249235930799440",
 		"depositsSumGwei": "0",
 		"consensusRewardsGwei": "759381695102",
-		"txFeesSumWei": "9454082057787827859159",
-		"totalRewardsWei": "10213463752889827859159"
+		"txFeesSumWei": "52873548882879882546",
+		"totalRewardsWei": "812255243984879882546"
+	},
+	{
+		"day": "506",
+		"dayTime": "2022-08-11T14:00:00Z",
+		"apr": "0.0283454148298578",
+		"validators": "369091",
+		"startEpoch": "113850",
+		"effectiveBalanceGwei": "11793892000000000",
+		"startBalanceGwei": "12262437460952078",
+		"endBalanceGwei": "12263268722879042",
+		"depositsSumGwei": "0",
+		"consensusRewardsGwei": "831261926964",
+		"txFeesSumWei": "84636048922415724899",
+		"totalRewardsWei": "915897975886415724899"
+	},
+	{
+		"day": "507",
+		"dayTime": "2022-08-12T14:00:00Z",
+		"apr": "0.0273932626982114",
+		"validators": "370212",
+		"startEpoch": "114075",
+		"effectiveBalanceGwei": "11829696000000000",
+		"startBalanceGwei": "12299142019721173",
+		"endBalanceGwei": "12299964895737899",
+		"depositsSumGwei": "0",
+		"consensusRewardsGwei": "822876016726",
+		"txFeesSumWei": "64943079624631022585",
+		"totalRewardsWei": "887819096350631022585"
+	},
+	{
+		"day": "508",
+		"dayTime": "2022-08-13T14:00:00Z",
+		"apr": "0.030132772115029",
+		"validators": "371336",
+		"startEpoch": "114300",
+		"effectiveBalanceGwei": "11865598000000000",
+		"startBalanceGwei": "12335966199004980",
+		"endBalanceGwei": "12336867754681957",
+		"depositsSumGwei": "0",
+		"consensusRewardsGwei": "901555676977",
+		"txFeesSumWei": "78015173824490930246",
+		"totalRewardsWei": "979570850801490930246"
+	},
+	{
+		"day": "509",
+		"dayTime": "2022-08-14T14:00:00Z",
+		"apr": "0.0316133933193231",
+		"validators": "371984",
+		"startEpoch": "114525",
+		"effectiveBalanceGwei": "11886244000000000",
+		"startBalanceGwei": "12357603696434784",
+		"endBalanceGwei": "12358560181135050",
+		"depositsSumGwei": "0",
+		"consensusRewardsGwei": "956484700266",
+		"txFeesSumWei": "73007098806448533686",
+		"totalRewardsWei": "1029491799072448533686"
 	}
 ]
