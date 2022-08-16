@@ -5,6 +5,7 @@ go 1.18
 require (
 	github.com/attestantio/go-eth2-client v0.11.4
 	github.com/ethereum/go-ethereum v1.10.21
+	github.com/hashicorp/golang-lru v0.5.5-0.20210104140557-80c98217689d
 	github.com/rs/zerolog v1.26.1
 	github.com/shopspring/decimal v1.3.1
 	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4

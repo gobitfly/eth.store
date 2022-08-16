@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	v1 "github.com/attestantio/go-eth2-client/api/v1"
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
@@ -18,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	gethRPC "github.com/ethereum/go-ethereum/rpc"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
@@ -28,6 +30,8 @@ var execTimeout = time.Second * 120
 var execTimeoutMu = sync.Mutex{}
 var consTimeout = time.Second * 120
 var consTimeoutMu = sync.Mutex{}
+var validatorsCache *lru.Cache
+var validatorsCacheMu = sync.Mutex{}
 
 type Day struct {
 	Day                  decimal.Decimal `json:"day"`
@@ -146,7 +150,31 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 	return day, nil
 }
 
+func GetValidators(ctx context.Context, client *http.Service, stateID string) (map[phase0.ValidatorIndex]*v1.Validator, error) {
+	validatorsCacheMu.Lock()
+	defer validatorsCacheMu.Unlock()
+	key := fmt.Sprintf("%s:%s", client.Address(), stateID)
+	val, found := validatorsCache.Get(key)
+	if found {
+		return val.(map[phase0.ValidatorIndex]*v1.Validator), nil
+	}
+	vals, err := client.Validators(ctx, stateID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error getting validators for slot %v: %w", stateID, err)
+	}
+	validatorsCache.Add(key, vals)
+	return vals, nil
+}
+
 func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, error) {
+	if validatorsCache == nil {
+		c, err := lru.New(2)
+		if err != nil {
+			return nil, err
+		}
+		validatorsCache = c
+	}
+
 	gethRpcClient, err := gethRPC.Dial(elAddress)
 	if err != nil {
 		return nil, err
@@ -228,10 +256,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	validatorsByIndex := map[phase0.ValidatorIndex]*Validator{}
 	validatorsByPubkey := map[phase0.BLSPubKey]*Validator{}
 
-	startValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlot), nil)
+	startValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", firstSlot))
 	if err != nil {
 		return nil, fmt.Errorf("error getting startValidators for firstSlot %d: %w", firstSlot, err)
 	}
+
 	for _, val := range startValidators {
 		if !val.Status.IsActive() {
 			continue
@@ -247,10 +276,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 		validatorsByPubkey[val.Validator.PublicKey] = vv
 	}
 
-	endValidators, err := client.Validators(ctx, fmt.Sprintf("%d", endSlot), nil)
+	endValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", endSlot))
 	if err != nil {
-		return nil, fmt.Errorf("error getting endValidators for firstSlot %d: %w", firstSlot, err)
+		return nil, fmt.Errorf("error getting endValidators for endSlot %d: %w", endSlot, err)
 	}
+
 	for _, val := range endValidators {
 		v, exists := validatorsByIndex[val.Index]
 		if !exists {
