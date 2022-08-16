@@ -14,15 +14,20 @@ import (
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
+	gethRPC "github.com/ethereum/go-ethereum/rpc"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
 )
 
 var debugLevel = uint64(0)
-var timeout = time.Second * 120
-var timeoutMu = sync.Mutex{}
+var execTimeout = time.Second * 120
+var execTimeoutMu = sync.Mutex{}
+var consTimeout = time.Second * 120
+var consTimeoutMu = sync.Mutex{}
 
 type Day struct {
 	Day                  decimal.Decimal `json:"day"`
@@ -57,20 +62,32 @@ func GetDebugLevel() uint64 {
 	return atomic.LoadUint64(&debugLevel)
 }
 
-func SetApiTimeout(dur time.Duration) {
-	timeoutMu.Lock()
-	defer timeoutMu.Unlock()
-	timeout = dur
+func SetConsTimeout(dur time.Duration) {
+	consTimeoutMu.Lock()
+	defer consTimeoutMu.Unlock()
+	consTimeout = dur
 }
 
-func GetApiTimeout() time.Duration {
-	timeoutMu.Lock()
-	defer timeoutMu.Unlock()
-	return timeout
+func SetExecTimeout(dur time.Duration) {
+	execTimeoutMu.Lock()
+	defer execTimeoutMu.Unlock()
+	execTimeout = dur
+}
+
+func GetConsTimeout() time.Duration {
+	consTimeoutMu.Lock()
+	defer consTimeoutMu.Unlock()
+	return consTimeout
+}
+
+func GetExecTimeout() time.Duration {
+	execTimeoutMu.Lock()
+	defer execTimeoutMu.Unlock()
+	return execTimeout
 }
 
 func GetLatestDay(ctx context.Context, address string) (uint64, error) {
-	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetApiTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return 0, err
 	}
@@ -99,8 +116,13 @@ func GetLatestDay(ctx context.Context, address string) (uint64, error) {
 	return day, nil
 }
 
-func Calculate(ctx context.Context, address string, dayStr string) (*Day, error) {
-	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetApiTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, error) {
+	gethRpcClient, err := gethRPC.Dial(elAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	service, err := http.New(ctx, http.WithAddress(bnAddress), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +205,7 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 
 	endValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlotOfNextDay), nil)
 	if err != nil {
-		return nil, fmt.Errorf("error getting endValidators for firstSlotOfNextDay %d: %w", firstSlotOfCurrentDay, err)
+		return nil, fmt.Errorf("error getting endValidators for firstSlotOfNextDay %d: %w", firstSlotOfNextDay, err)
 	}
 	for _, val := range endValidators {
 		v, exists := validatorsByIndex[val.Index]
@@ -236,25 +258,56 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 				return fmt.Errorf("unknown block version for block %v: %v", i, block.Version)
 			}
 
-			validatorsMu.Lock()
-			defer validatorsMu.Unlock()
-
 			if exec != nil {
+				// only add tx fees of blocks that have been proposed from validators that have been active the whole day
 				v, exists := validatorsByIndex[proposerIndex]
 				if exists {
-					// only add tx fees of blocks that have been proposed from validators that have been active the whole day
+					txHashes := []common.Hash{}
 					for _, tx := range exec.Transactions {
 						var decTx gethTypes.Transaction
 						err := decTx.UnmarshalBinary([]byte(tx))
 						if err != nil {
 							return err
 						}
-						txFee := new(big.Int).Mul(decTx.GasPrice(), new(big.Int).SetUint64(decTx.Gas()))
-						v.TxFeesSumWei.Add(v.TxFeesSumWei, txFee)
+						txHashes = append(txHashes, decTx.Hash())
+					}
+
+					ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
+					defer cancel()
+					txReceipts, err := batchRequestReceipts(ctx, gethRpcClient, txHashes)
+					if err != nil {
+						return err
+					}
+
+					totalTxFee := new(big.Int)
+					for _, r := range txReceipts {
+						txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
+						totalTxFee.Add(totalTxFee, txFee)
+					}
+
+					// base fee per gas is stored little-endian but we need it
+					// big-endian for big.Int.
+					var baseFeePerGasBEBytes [32]byte
+					for i := 0; i < 32; i++ {
+						baseFeePerGasBEBytes[i] = exec.BaseFeePerGas[32-1-i]
+					}
+					baseFeePerGas := new(big.Int).SetBytes(baseFeePerGasBEBytes[:])
+					burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(exec.GasUsed))
+
+					totalTxFee.Sub(totalTxFee, burntFee)
+
+					validatorsMu.Lock()
+					v.TxFeesSumWei.Add(v.TxFeesSumWei, totalTxFee)
+					validatorsMu.Unlock()
+
+					if GetDebugLevel() > 0 {
+						log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v, burnt: %v\n", i, exec.BlockNumber, baseFeePerGas, totalTxFee, burntFee)
 					}
 				}
 			}
 
+			validatorsMu.Lock()
+			defer validatorsMu.Unlock()
 			for _, d := range deposits {
 				v, exists := validatorsByPubkey[d.Data.PublicKey]
 				if !exists {
@@ -311,4 +364,48 @@ func Calculate(ctx context.Context, address string, dayStr string) (*Day, error)
 	}
 
 	return ethstoreDay, nil
+}
+
+func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashes []common.Hash) ([]*TxReceipt, error) {
+	elems := make([]gethRPC.BatchElem, 0, len(txHashes))
+	errors := make([]error, 0, len(txHashes))
+	txReceipts := make([]*TxReceipt, len(txHashes))
+	for i, h := range txHashes {
+		txReceipt := &TxReceipt{}
+		err := error(nil)
+		elems = append(elems, gethRPC.BatchElem{
+			Method: "eth_getTransactionReceipt",
+			Args:   []interface{}{h.Hex()},
+			Result: txReceipt,
+			Error:  err,
+		})
+		txReceipts[i] = txReceipt
+		errors = append(errors, err)
+	}
+	ioErr := elClient.BatchCallContext(ctx, elems)
+	if ioErr != nil {
+		return nil, ioErr
+	}
+	for _, e := range errors {
+		if e != nil {
+			return nil, e
+		}
+	}
+	return txReceipts, nil
+}
+
+type TxReceipt struct {
+	BlockHash         *common.Hash    `json:"blockHash"`
+	BlockNumber       *hexutil.Big    `json:"blockNumber"`
+	ContractAddress   *common.Address `json:"contractAddress,omitempty"`
+	CumulativeGasUsed hexutil.Uint64  `json:"cumulativeGasUsed"`
+	EffectiveGasPrice *hexutil.Big    `json:"effectiveGasPrice"`
+	From              *common.Address `json:"from,omitempty"`
+	GasUsed           hexutil.Uint64  `json:"gasUsed"`
+	LogsBloom         hexutil.Bytes   `json:"logsBloom"`
+	Status            hexutil.Uint64  `json:"status"`
+	To                *common.Address `json:"to,omitempty"`
+	TransactionHash   *common.Hash    `json:"transactionHash"`
+	TransactionIndex  hexutil.Uint64  `json:"transactionIndex"`
+	Type              hexutil.Uint64  `json:"type"`
 }

@@ -20,20 +20,24 @@ import (
 )
 
 var opts struct {
-	Days       string
-	Validators string
-	ApiAddress string
-	ApiTimeout time.Duration
-	Json       bool
-	JsonFile   string
-	DebugLevel uint64
-	Version    bool
+	Days        string
+	Validators  string
+	ConsAddress string
+	ConsTimeout time.Duration
+	ExecAddress string
+	ExecTimeout time.Duration
+	Json        bool
+	JsonFile    string
+	DebugLevel  uint64
+	Version     bool
 }
 
 func main() {
 	flag.StringVar(&opts.Days, "days", "", "days to calculate eth.store for, format: \"1-3\" or \"1,4,6\"")
-	flag.StringVar(&opts.ApiAddress, "api.address", "http://localhost:4000", "address of the conensus-node-api")
-	flag.DurationVar(&opts.ApiTimeout, "api.timeout", time.Second*120, "timeout duration for the consensus-node-api")
+	flag.StringVar(&opts.ConsAddress, "cons.address", "http://localhost:4000", "address of the conensus-node-api")
+	flag.DurationVar(&opts.ConsTimeout, "cons.timeout", time.Second*120, "timeout duration for the consensus-node-api")
+	flag.StringVar(&opts.ExecAddress, "exec.address", "http://localhost:4000", "address of the execution-node-api")
+	flag.DurationVar(&opts.ExecTimeout, "exec.timeout", time.Second*120, "timeout duration for the execution-node-api")
 	flag.BoolVar(&opts.Json, "json", false, "format output as json")
 	flag.StringVar(&opts.JsonFile, "json.file", "", "path to file to write results into, only missing days will be added")
 	flag.Uint64Var(&opts.DebugLevel, "debug", 0, "set debug-level (higher level will increase verbosity)")
@@ -45,7 +49,8 @@ func main() {
 		return
 	}
 
-	ethstore.SetApiTimeout(opts.ApiTimeout)
+	ethstore.SetConsTimeout(opts.ConsTimeout)
+	ethstore.SetExecTimeout(opts.ExecTimeout)
 	ethstore.SetDebugLevel(opts.DebugLevel)
 
 	days := []uint64{}
@@ -62,7 +67,7 @@ func main() {
 		}
 		var toDay uint64
 		if daysSplit[1] == "latest" || daysSplit[1] == "finalized" {
-			d, err := ethstore.GetLatestDay(context.Background(), opts.ApiAddress)
+			d, err := ethstore.GetLatestDay(context.Background(), opts.ConsAddress)
 			if err != nil {
 				log.Fatalf("error getting lattest day: %v", err)
 			}
@@ -90,7 +95,7 @@ func main() {
 			days = append(days, di)
 		}
 	} else if opts.Days == "latest" || opts.Days == "finalized" {
-		d, err := ethstore.GetLatestDay(context.Background(), opts.ApiAddress)
+		d, err := ethstore.GetLatestDay(context.Background(), opts.ConsAddress)
 		if err != nil {
 			log.Fatalf("error getting lattest day: %v", err)
 		}
@@ -128,7 +133,7 @@ func main() {
 				logEthstoreDay(d)
 				continue
 			}
-			d, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", dd))
+			d, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd))
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
@@ -151,7 +156,7 @@ func main() {
 	} else {
 		result := []*ethstore.Day{}
 		for _, dd := range days {
-			d, err := ethstore.Calculate(context.Background(), opts.ApiAddress, fmt.Sprintf("%d", dd))
+			d, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd))
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
