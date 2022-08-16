@@ -86,7 +86,7 @@ func GetExecTimeout() time.Duration {
 	return execTimeout
 }
 
-func GetLatestDay(ctx context.Context, address string) (uint64, error) {
+func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return 0, err
@@ -107,12 +107,42 @@ func GetLatestDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	bbh, err := client.BeaconBlockHeader(ctx, "finalized")
+	h, err := client.BeaconBlockHeader(ctx, "finalized")
 	if err != nil {
 		return 0, err
 	}
 
-	day := uint64(bbh.Header.Message.Slot)/slotsPerDay - 1
+	day := uint64(h.Header.Message.Slot)/slotsPerDay - 1
+	return day, nil
+}
+
+func GetHeadDay(ctx context.Context, address string) (uint64, error) {
+	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	if err != nil {
+		return 0, err
+	}
+	client := service.(*http.Service)
+	apiSpec, err := client.Spec(ctx)
+	if err != nil {
+		return 0, err
+	}
+	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	if !exists {
+		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
+	}
+	secondsPerSlotDur, ok := secondsPerSlotIf.(time.Duration)
+	if !ok {
+		return 0, fmt.Errorf("invalid format of SECONDS_PER_SLOT in spec")
+	}
+	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
+	slotsPerDay := 3600 * 24 / secondsPerSlot
+
+	h, err := client.BeaconBlockHeader(ctx, "finalized")
+	if err != nil {
+		return 0, err
+	}
+
+	day := uint64(h.Header.Message.Slot) / slotsPerDay
 	return day, nil
 }
 
@@ -153,40 +183,54 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 
 	slotsPerDay := 3600 * 24 / secondsPerSlot
+
+	finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
+	if err != nil {
+		return nil, err
+	}
+	finalizedSlot := uint64(finalizedHeader.Header.Message.Slot)
+	finalizedDay := finalizedSlot/slotsPerDay - 1
+
 	var day uint64
-	if dayStr == "finalized" || dayStr == "latest" {
-		bbh, err := client.BeaconBlockHeader(ctx, "finalized")
-		if err != nil {
-			return nil, err
-		}
-		day = uint64(bbh.Header.Message.Slot)/slotsPerDay - 1
+	if dayStr == "finalized" {
+		day = finalizedDay
+	} else if dayStr == "head" {
+		day = finalizedSlot / slotsPerDay
 	} else {
 		day, err = strconv.ParseUint(dayStr, 10, 64)
 		if err != nil {
 			return nil, err
 		}
 	}
-	firstSlotOfCurrentDay := day * slotsPerDay
-	firstSlotOfNextDay := (day + 1) * slotsPerDay
-	firstEpochOfCurrentDay := firstSlotOfCurrentDay / slotsPerEpoch
-	firstEpochOfNextDay := firstSlotOfNextDay / slotsPerEpoch
+
+	firstSlot := day * slotsPerDay
+	endSlot := (day + 1) * slotsPerDay // first slot not included in this eth.store-day
+
+	if endSlot > finalizedSlot {
+		endSlot = finalizedSlot
+	}
+	lastSlot := endSlot - 1
+
+	firstEpoch := firstSlot / slotsPerEpoch
+	lastEpoch := lastSlot / slotsPerEpoch
+	endEpoch := lastEpoch + 1
 
 	genesis, err := client.GenesisTime(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error getting genesisTime: %w", err)
 	}
-	dayTime := time.Unix(genesis.Unix()+int64(firstSlotOfCurrentDay)*int64(secondsPerSlot), 0)
+	dayTime := time.Unix(genesis.Unix()+int64(firstSlot)*int64(secondsPerSlot), 0)
 
 	if GetDebugLevel() > 0 {
-		log.Printf("DEBUG eth.store: calculating day %v (%v, firstEpochOfCurrentDay: %v, firstSlotOfCurrentDay: %v, firstSlotOfNextDay: %v)\n", day, dayTime, firstEpochOfCurrentDay, firstSlotOfCurrentDay, firstSlotOfNextDay)
+		log.Printf("DEBUG eth.store: calculating day %v (%v, epochs: %v-%v, slots: %v-%v, genesis: %v)\n", day, dayTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis)
 	}
 
 	validatorsByIndex := map[phase0.ValidatorIndex]*Validator{}
 	validatorsByPubkey := map[phase0.BLSPubKey]*Validator{}
 
-	startValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlotOfCurrentDay), nil)
+	startValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlot), nil)
 	if err != nil {
-		return nil, fmt.Errorf("error getting startValidators for firstSlotOfCurrentDay %d: %w", firstSlotOfCurrentDay, err)
+		return nil, fmt.Errorf("error getting startValidators for firstSlot %d: %w", firstSlot, err)
 	}
 	for _, val := range startValidators {
 		if !val.Status.IsActive() {
@@ -203,16 +247,16 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 		validatorsByPubkey[val.Validator.PublicKey] = vv
 	}
 
-	endValidators, err := client.Validators(ctx, fmt.Sprintf("%d", firstSlotOfNextDay), nil)
+	endValidators, err := client.Validators(ctx, fmt.Sprintf("%d", endSlot), nil)
 	if err != nil {
-		return nil, fmt.Errorf("error getting endValidators for firstSlotOfNextDay %d: %w", firstSlotOfCurrentDay, err)
+		return nil, fmt.Errorf("error getting endValidators for firstSlot %d: %w", firstSlot, err)
 	}
 	for _, val := range endValidators {
 		v, exists := validatorsByIndex[val.Index]
 		if !exists {
 			continue
 		}
-		if uint64(val.Validator.ExitEpoch) < firstEpochOfNextDay {
+		if uint64(val.Validator.ExitEpoch) < endEpoch {
 			// do not account validators that have not been active until the end of the day
 			delete(validatorsByIndex, val.Index)
 			delete(validatorsByPubkey, val.Validator.PublicKey)
@@ -226,11 +270,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	g.SetLimit(10)
 	validatorsMu := sync.Mutex{}
 
-	// get all deposits and txs of all active validators in the slot interval [firstSlotOfCurrentDay,firstSlotOfNextDay)
-	for i := firstSlotOfCurrentDay; i < firstSlotOfNextDay; i++ {
+	// get all deposits and txs of all active validators in the slot interval [startSlot,endSlot)
+	for i := firstSlot; i < endSlot; i++ {
 		i := i
-		if GetDebugLevel() > 0 && (firstSlotOfNextDay-i)%1000 == 0 {
-			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlotOfCurrentDay)/float64(firstSlotOfNextDay-firstSlotOfCurrentDay), i, firstSlotOfCurrentDay, firstSlotOfNextDay)
+		if GetDebugLevel() > 0 && (endSlot-i)%1000 == 0 {
+			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
 			block, err := client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
@@ -347,7 +391,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	ethstoreDay := &Day{
 		Day:                  decimal.NewFromInt(int64(day)),
 		DayTime:              dayTime,
-		StartEpoch:           decimal.NewFromInt(int64(firstEpochOfCurrentDay)),
+		StartEpoch:           decimal.NewFromInt(int64(firstEpoch)),
 		Apr:                  decimal.NewFromInt(365).Mul(totalRewardsWei).Div(decimal.NewFromInt(int64(totalEffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
 		Validators:           decimal.NewFromInt(int64(len(validatorsByIndex))),
 		EffectiveBalanceGwei: decimal.NewFromInt(int64(totalEffectiveBalanceGwei)),

@@ -66,8 +66,14 @@ func main() {
 			log.Fatalf("error parsing days-flag: %v", err)
 		}
 		var toDay uint64
-		if daysSplit[1] == "latest" || daysSplit[1] == "finalized" {
-			d, err := ethstore.GetLatestDay(context.Background(), opts.ConsAddress)
+		if daysSplit[1] == "finalized" {
+			d, err := ethstore.GetFinalizedDay(context.Background(), opts.ConsAddress)
+			if err != nil {
+				log.Fatalf("error getting lattest day: %v", err)
+			}
+			toDay = d
+		} else if daysSplit[1] == "head" {
+			d, err := ethstore.GetHeadDay(context.Background(), opts.ConsAddress)
 			if err != nil {
 				log.Fatalf("error getting lattest day: %v", err)
 			}
@@ -94,8 +100,14 @@ func main() {
 			}
 			days = append(days, di)
 		}
-	} else if opts.Days == "latest" || opts.Days == "finalized" {
-		d, err := ethstore.GetLatestDay(context.Background(), opts.ConsAddress)
+	} else if opts.Days == "finalized" {
+		d, err := ethstore.GetFinalizedDay(context.Background(), opts.ConsAddress)
+		if err != nil {
+			log.Fatalf("error getting lattest day: %v", err)
+		}
+		days = []uint64{d}
+	} else if opts.Days == "head" {
+		d, err := ethstore.GetHeadDay(context.Background(), opts.ConsAddress)
 		if err != nil {
 			log.Fatalf("error getting lattest day: %v", err)
 		}
@@ -108,7 +120,7 @@ func main() {
 		days = []uint64{d}
 	}
 
-	if opts.JsonFile != "" {
+	if opts.JsonFile != "" && opts.Days != "head" {
 		fileDays := []*ethstore.Day{}
 		_, err := os.Stat(opts.JsonFile)
 		if err == nil {
