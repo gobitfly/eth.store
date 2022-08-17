@@ -7138,5 +7138,33 @@
 		"consensusRewardsGwei": "956484700266",
 		"txFeesSumWei": "73007098806448533686",
 		"totalRewardsWei": "1029491799072448533686"
+	},
+	{
+		"day": "510",
+		"dayTime": "2022-08-15T14:00:00Z",
+		"apr": "0.0294978027443424",
+		"validators": "372223",
+		"startEpoch": "114750",
+		"effectiveBalanceGwei": "11893833000000000",
+		"startBalanceGwei": "12366207948402087",
+		"endBalanceGwei": "12367071641449149",
+		"depositsSumGwei": "0",
+		"consensusRewardsGwei": "863693047062",
+		"txFeesSumWei": "97517746658960863877",
+		"totalRewardsWei": "961210793720960863877"
+	},
+	{
+		"day": "511",
+		"dayTime": "2022-08-16T14:00:00Z",
+		"apr": "0.0260154655959652",
+		"validators": "373348",
+		"startEpoch": "114975",
+		"effectiveBalanceGwei": "11929758000000000",
+		"startBalanceGwei": "12403073250336058",
+		"endBalanceGwei": "12403860974607163",
+		"depositsSumGwei": "32000000000",
+		"consensusRewardsGwei": "755724271105",
+		"txFeesSumWei": "94572191407851245752",
+		"totalRewardsWei": "850296462512851245752"
 	}
 ]
