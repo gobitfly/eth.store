@@ -56,7 +56,7 @@ func main() {
 	days := []uint64{}
 
 	if opts.Days == "all" {
-		opts.Days = "0-latest"
+		opts.Days = "0-finalized"
 	}
 
 	if strings.ContainsAny(opts.Days, "-") {
