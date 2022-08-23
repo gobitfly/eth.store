@@ -4,16 +4,19 @@
 <title>ETH.STORE</title>
 <style>
 body {background:#f1852c;color:white;font-family:Barlow,sans-serif;margin:auto;display:block;text-align: center;}
+#wrapper {max-width:1000px; margin: auto;}
 .chart {margin:40px;background:white;}
 .responsive {max-width: 100%; display: block; height: auto; margin: auto}
 p {margin:40px;}
 </style>
 </head>
+<div id="wrapper">
 <img class="responsive" src="https://user-images.githubusercontent.com/26490734/174131682-598758e0-1b5d-4b8d-8995-26cab3f65f22.png">
 <p>ETH.STORE (Ether Staking Offered Rate) represents the average financial return validators on the Ethereum network have achieved in a 24-hour period. See the <a href="https://github.com/gobitfly/eth.store">GitHub-Repository</a> for more information.</p>
 <canvas id="chart-mainnet" class="chart"></canvas>
 <canvas id="chart-goerli" class="chart"></canvas>
 <canvas id="chart-sepolia" class="chart"></canvas>
+<div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
 <script>
 drawChart("mainnet")
