@@ -383,7 +383,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 						return fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", i, err)
 					}
 
-					totalTxFee := new(big.Int)
+					totalTxFee := big.NewInt(0)
 					for _, r := range txReceipts {
 						txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
 						totalTxFee.Add(totalTxFee, txFee)
