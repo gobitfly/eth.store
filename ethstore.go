@@ -385,6 +385,9 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 
 					totalTxFee := big.NewInt(0)
 					for _, r := range txReceipts {
+						if r.EffectiveGasPrice == nil {
+							return fmt.Errorf("no EffectiveGasPrice for slot %v: %v", i, txHashes)
+						}
 						txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
 						totalTxFee.Add(totalTxFee, txFee)
 					}
