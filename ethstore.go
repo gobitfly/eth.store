@@ -333,7 +333,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	// get all deposits and txs of all active validators in the slot interval [startSlot,endSlot)
 	for i := firstSlot; i < endSlot; i++ {
 		i := i
-		if (endSlot-i)%1000 == 0 {
+		if GetDebugLevel() > 0 && (endSlot-i)%1000 == 0 {
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
