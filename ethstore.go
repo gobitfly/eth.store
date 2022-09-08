@@ -200,7 +200,6 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	}
 	genesisForkVersion, ok := genesisForkVersionIf.(phase0.Version)
 	if !ok {
-		fmt.Printf("whaaaat %T", genesisForkVersionIf)
 		return nil, fmt.Errorf("invalid format of GENESIS_FORK_VERSION in spec")
 	}
 
@@ -210,7 +209,6 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	}
 	domainDeposit, ok := domainDepositIf.(phase0.DomainType)
 	if !ok {
-		fmt.Printf("whaaaat %T", domainDepositIf)
 		return nil, fmt.Errorf("invalid format of DOMAIN_DEPOSIT in spec")
 	}
 
@@ -219,9 +217,6 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	if err != nil {
 		return nil, err
 	}
-	_ = genesisForkVersion
-	_ = domainDeposit
-	_ = depositDomainComputed
 
 	slotsPerEpochIf, exists := apiSpec["SLOTS_PER_EPOCH"]
 	if !exists {
@@ -282,7 +277,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	dayTime := time.Unix(genesis.Unix()+int64(firstSlot)*int64(secondsPerSlot), 0)
 
 	if GetDebugLevel() > 0 {
-		log.Printf("DEBUG eth.store: calculating day %v (%v, epochs: %v-%v, slots: %v-%v, genesis: %v)\n", day, dayTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis)
+		log.Printf("DEBUG eth.store: calculating day %v (%v, epochs: %v-%v, slots: %v-%v, genesis: %v, finalizedSlot: %v)\n", day, dayTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis, finalizedSlot)
 	}
 
 	validatorsByIndex := map[phase0.ValidatorIndex]*Validator{}
@@ -327,6 +322,9 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 		// set endBalance of validator to the balance of the first epoch of the next day
 		v.EndBalanceGwei = val.Balance
 	}
+	if GetDebugLevel() > 0 {
+		log.Printf("DEBUG eth.store: startValidators: %v, endValidators: %v, ethstoreValidtors: %v", len(startValidators), len(endValidators), len(validatorsByIndex))
+	}
 
 	g := new(errgroup.Group)
 	g.SetLimit(10)
@@ -335,7 +333,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	// get all deposits and txs of all active validators in the slot interval [startSlot,endSlot)
 	for i := firstSlot; i < endSlot; i++ {
 		i := i
-		if GetDebugLevel() > 0 && (endSlot-i)%1000 == 0 {
+		if (endSlot-i)%1000 == 0 {
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
