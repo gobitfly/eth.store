@@ -337,7 +337,15 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
-			block, err := client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
+			var block *spec.VersionedSignedBeaconBlock
+			var err error
+			for i := 0; i < 10; i++ { // retry up to 10 times on failure
+				block, err = client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
+
+				if err == nil {
+					break
+				}
+			}
 			if err != nil {
 				return fmt.Errorf("error getting block %v: %w", i, err)
 			}
