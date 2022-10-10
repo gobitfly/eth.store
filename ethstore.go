@@ -339,11 +339,13 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 		g.Go(func() error {
 			var block *spec.VersionedSignedBeaconBlock
 			var err error
-			for i := 0; i < 10; i++ { // retry up to 10 times on failure
+			for j := 0; j < 10; j++ { // retry up to 10 times on failure
 				block, err = client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
 
 				if err == nil {
 					break
+				} else {
+					log.Printf("error retrieving beacon block at slot %v: %v", i, err)
 				}
 			}
 			if err != nil {
