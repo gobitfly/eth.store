@@ -145,7 +145,7 @@ func main() {
 				logEthstoreDay(d)
 				continue
 			}
-			d, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd))
+			d, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10)
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
@@ -168,7 +168,7 @@ func main() {
 	} else {
 		result := []*ethstore.Day{}
 		for _, dd := range days {
-			d, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd))
+			d, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10)
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}

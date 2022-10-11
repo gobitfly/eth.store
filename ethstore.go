@@ -169,7 +169,7 @@ func GetValidators(ctx context.Context, client *http.Service, stateID string) (m
 	return vals, nil
 }
 
-func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, error) {
+func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, error) {
 	if validatorsCache == nil {
 		c, err := lru.New(2)
 		if err != nil {
@@ -327,7 +327,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 	}
 
 	g := new(errgroup.Group)
-	g.SetLimit(10)
+	g.SetLimit(concurrency)
 	validatorsMu := sync.Mutex{}
 
 	// get all deposits and txs of all active validators in the slot interval [startSlot,endSlot)
