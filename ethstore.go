@@ -346,6 +346,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 					break
 				} else {
 					log.Printf("error retrieving beacon block at slot %v: %v", i, err)
+					time.Sleep(time.Duration(j) * time.Second)
 				}
 			}
 			if err != nil {
@@ -395,6 +396,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 							break
 						} else {
 							log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
 						}
 						cancel()
 					}
