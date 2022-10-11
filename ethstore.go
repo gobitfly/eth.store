@@ -386,9 +386,18 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string) (*Day, 
 						txHashes = append(txHashes, decTx.Hash())
 					}
 
-					ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
-					defer cancel()
-					txReceipts, err := batchRequestReceipts(ctx, gethRpcClient, txHashes)
+					var txReceipts []*TxReceipt
+					for j := 0; j < 10; j++ { // retry up to 10 times
+						ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
+						txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
+						if err == nil {
+							cancel()
+							break
+						} else {
+							log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
+						}
+						cancel()
+					}
 					if err != nil {
 						return fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", i, err)
 					}
