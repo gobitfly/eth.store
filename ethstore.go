@@ -258,6 +258,10 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		}
 	}
 
+	if day > finalizedDay {
+		return nil, fmt.Errorf("requested to calculate eth.store for a future day (last finalized day: %v, requested day: %v)", finalizedDay, day)
+	}
+
 	firstSlot := day * slotsPerDay
 	endSlot := (day + 1) * slotsPerDay // first slot not included in this eth.store-day
 
