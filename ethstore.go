@@ -493,7 +493,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 		ethstorePerValidator[uint64(index)] = &Day{
 			Day:                  decimal.NewFromInt(int64(day)),
-			DayTime:              dayTime,
+			DayTime:              startTime,
 			StartEpoch:           decimal.NewFromInt(int64(firstEpoch)),
 			Apr:                  decimal.NewFromInt(365).Mul(validatorRewardsWei).Div(decimal.NewFromInt(int64(v.EffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
 			Validators:           decimal.NewFromInt(int64(len(validatorsByIndex))),
