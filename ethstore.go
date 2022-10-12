@@ -278,10 +278,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	if err != nil {
 		return nil, nil, fmt.Errorf("error getting genesisTime: %w", err)
 	}
-	dayTime := time.Unix(genesis.Unix()+int64(firstSlot)*int64(secondsPerSlot), 0)
+	startTime := time.Unix(genesis.Unix()+int64(firstSlot)*int64(secondsPerSlot), 0)
+	endTime := time.Unix(genesis.Unix()+int64(lastSlot)*int64(secondsPerSlot), 0)
 
 	if GetDebugLevel() > 0 {
-		log.Printf("DEBUG eth.store: calculating day %v (%v, epochs: %v-%v, slots: %v-%v, genesis: %v, finalizedSlot: %v)\n", day, dayTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis, finalizedSlot)
+		log.Printf("DEBUG eth.store: calculating day %v (%v - %v, epochs: %v-%v, slots: %v-%v, genesis: %v, finalizedSlot: %v)\n", day, startTime, endTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis, finalizedSlot)
 	}
 
 	validatorsByIndex := map[phase0.ValidatorIndex]*Validator{}
