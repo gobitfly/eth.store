@@ -328,7 +328,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		v.EndBalanceGwei = val.Balance
 	}
 	if GetDebugLevel() > 0 {
-		log.Printf("DEBUG eth.store: startValidators: %v, endValidators: %v, ethstoreValidtors: %v", len(startValidators), len(endValidators), len(validatorsByIndex))
+		log.Printf("DEBUG eth.store: startValidators: %v, endValidators: %v, ethstoreValidators: %v", len(startValidators), len(endValidators), len(validatorsByIndex))
 	}
 
 	g := new(errgroup.Group)
