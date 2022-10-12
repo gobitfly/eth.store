@@ -169,71 +169,71 @@ func GetValidators(ctx context.Context, client *http.Service, stateID string) (m
 	return vals, nil
 }
 
-func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, error) {
+func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, map[uint64]*Day, error) {
 	if validatorsCache == nil {
 		c, err := lru.New(2)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		validatorsCache = c
 	}
 
 	gethRpcClient, err := gethRPC.Dial(elAddress)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	service, err := http.New(ctx, http.WithAddress(bnAddress), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	client := service.(*http.Service)
 
 	apiSpec, err := client.Spec(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	genesisForkVersionIf, exists := apiSpec["GENESIS_FORK_VERSION"]
 	if !exists {
-		return nil, fmt.Errorf("undefined GENESIS_FORK_VERSION in spec")
+		return nil, nil, fmt.Errorf("undefined GENESIS_FORK_VERSION in spec")
 	}
 	genesisForkVersion, ok := genesisForkVersionIf.(phase0.Version)
 	if !ok {
-		return nil, fmt.Errorf("invalid format of GENESIS_FORK_VERSION in spec")
+		return nil, nil, fmt.Errorf("invalid format of GENESIS_FORK_VERSION in spec")
 	}
 
 	domainDepositIf, exists := apiSpec["DOMAIN_DEPOSIT"]
 	if !exists {
-		return nil, fmt.Errorf("undefined DOMAIN_DEPOSIT in spec")
+		return nil, nil, fmt.Errorf("undefined DOMAIN_DEPOSIT in spec")
 	}
 	domainDeposit, ok := domainDepositIf.(phase0.DomainType)
 	if !ok {
-		return nil, fmt.Errorf("invalid format of DOMAIN_DEPOSIT in spec")
+		return nil, nil, fmt.Errorf("invalid format of DOMAIN_DEPOSIT in spec")
 	}
 
 	genesisValidatorsRoot := [32]byte{}
 	depositDomainComputed, err := signing.ComputeDomain(domainDeposit, genesisForkVersion[:], genesisValidatorsRoot[:])
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	slotsPerEpochIf, exists := apiSpec["SLOTS_PER_EPOCH"]
 	if !exists {
-		return nil, fmt.Errorf("undefined SLOTS_PER_EPOCH in spec")
+		return nil, nil, fmt.Errorf("undefined SLOTS_PER_EPOCH in spec")
 	}
 	slotsPerEpoch, ok := slotsPerEpochIf.(uint64)
 	if !ok {
-		return nil, fmt.Errorf("invalid format of SLOTS_PER_EPOCH in spec")
+		return nil, nil, fmt.Errorf("invalid format of SLOTS_PER_EPOCH in spec")
 	}
 
 	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
 	if !exists {
-		return nil, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
+		return nil, nil, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
 	secondsPerSlotDur, ok := secondsPerSlotIf.(time.Duration)
 	if !ok {
-		return nil, fmt.Errorf("invalid format of SECONDS_PER_SLOT in spec")
+		return nil, nil, fmt.Errorf("invalid format of SECONDS_PER_SLOT in spec")
 	}
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 
@@ -241,7 +241,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	finalizedSlot := uint64(finalizedHeader.Header.Message.Slot)
 	finalizedDay := finalizedSlot/slotsPerDay - 1
@@ -254,12 +254,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	} else {
 		day, err = strconv.ParseUint(dayStr, 10, 64)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if day > finalizedDay {
-		return nil, fmt.Errorf("requested to calculate eth.store for a future day (last finalized day: %v, requested day: %v)", finalizedDay, day)
+		return nil, nil, fmt.Errorf("requested to calculate eth.store for a future day (last finalized day: %v, requested day: %v)", finalizedDay, day)
 	}
 
 	firstSlot := day * slotsPerDay
@@ -276,7 +276,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	genesis, err := client.GenesisTime(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("error getting genesisTime: %w", err)
+		return nil, nil, fmt.Errorf("error getting genesisTime: %w", err)
 	}
 	dayTime := time.Unix(genesis.Unix()+int64(firstSlot)*int64(secondsPerSlot), 0)
 
@@ -289,7 +289,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	startValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", firstSlot))
 	if err != nil {
-		return nil, fmt.Errorf("error getting startValidators for firstSlot %d: %w", firstSlot, err)
+		return nil, nil, fmt.Errorf("error getting startValidators for firstSlot %d: %w", firstSlot, err)
 	}
 
 	for _, val := range startValidators {
@@ -309,7 +309,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	endValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", endSlot))
 	if err != nil {
-		return nil, fmt.Errorf("error getting endValidators for endSlot %d: %w", endSlot, err)
+		return nil, nil, fmt.Errorf("error getting endValidators for endSlot %d: %w", endSlot, err)
 	}
 
 	for _, val := range endValidators {
@@ -469,7 +469,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var totalEffectiveBalanceGwei phase0.Gwei
@@ -478,12 +478,33 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	var totalDepositsSumGwei phase0.Gwei
 	totalTxFeesSumWei := new(big.Int)
 
-	for _, v := range validatorsByIndex {
+	ethstorePerValidator := make(map[uint64]*Day, len(validatorsByIndex))
+
+	for index, v := range validatorsByIndex {
 		totalEffectiveBalanceGwei += v.EffectiveBalanceGwei
 		totalStartBalanceGwei += v.StartBalanceGwei
 		totalEndBalanceGwei += v.EndBalanceGwei
 		totalDepositsSumGwei += v.DepositsSumGwei
 		totalTxFeesSumWei.Add(totalTxFeesSumWei, v.TxFeesSumWei)
+
+		validatorConsensusRewardsGwei := decimal.NewFromInt(int64(v.EndBalanceGwei) - int64(v.StartBalanceGwei) - int64(v.DepositsSumGwei))
+		validatorRewardsWei := decimal.NewFromBigInt(v.TxFeesSumWei, 0).Add(validatorConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
+
+		ethstorePerValidator[uint64(index)] = &Day{
+			Day:                  decimal.NewFromInt(int64(day)),
+			DayTime:              dayTime,
+			StartEpoch:           decimal.NewFromInt(int64(firstEpoch)),
+			Apr:                  decimal.NewFromInt(365).Mul(validatorRewardsWei).Div(decimal.NewFromInt(int64(v.EffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
+			Validators:           decimal.NewFromInt(int64(len(validatorsByIndex))),
+			EffectiveBalanceGwei: decimal.NewFromInt(int64(v.EffectiveBalanceGwei)),
+			StartBalanceGwei:     decimal.NewFromInt(int64(v.StartBalanceGwei)),
+			EndBalanceGwei:       decimal.NewFromInt(int64(v.EndBalanceGwei)),
+			DepositsSumGwei:      decimal.NewFromInt(int64(v.DepositsSumGwei)),
+			TxFeesSumWei:         decimal.NewFromBigInt(v.TxFeesSumWei, 0),
+			ConsensusRewardsGwei: validatorConsensusRewardsGwei,
+			TotalRewardsWei:      validatorRewardsWei,
+		}
+
 	}
 
 	totalConsensusRewardsGwei := decimal.NewFromInt(int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei))
@@ -508,7 +529,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		log.Printf("DEBUG eth.store: %+v\n", ethstoreDay)
 	}
 
-	return ethstoreDay, nil
+	return ethstoreDay, ethstorePerValidator, nil
 }
 
 func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashes []common.Hash) ([]*TxReceipt, error) {
