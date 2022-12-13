@@ -182,6 +182,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	if err != nil {
 		return nil, nil, err
 	}
+	defer gethRpcClient.Close()
 
 	service, err := http.New(ctx, http.WithAddress(bnAddress), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
@@ -331,7 +332,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		log.Printf("DEBUG eth.store: startValidators: %v, endValidators: %v, ethstoreValidators: %v", len(startValidators), len(endValidators), len(validatorsByIndex))
 	}
 
-	g := new(errgroup.Group)
+	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 	validatorsMu := sync.Mutex{}
 
@@ -341,12 +342,14 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		if GetDebugLevel() > 0 && (endSlot-i)%1000 == 0 {
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
+		err := gCtx.Err()
+		if err != nil {
+			return nil, nil, err
+		}
 		g.Go(func() error {
 			var block *spec.VersionedSignedBeaconBlock
-			var err error
 			for j := 0; j < 10; j++ { // retry up to 10 times on failure
-				block, err = client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
-
+				block, err = client.SignedBeaconBlock(gCtx, fmt.Sprintf("%d", i))
 				if err == nil {
 					break
 				} else {
@@ -394,7 +397,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 					var txReceipts []*TxReceipt
 					for j := 0; j < 10; j++ { // retry up to 10 times
-						ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
+						ctx, cancel := context.WithTimeout(gCtx, GetExecTimeout())
 						txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
 						if err == nil {
 							cancel()
