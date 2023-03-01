@@ -14,6 +14,7 @@ import (
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
+	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -46,6 +47,7 @@ type Day struct {
 	StartBalanceGwei     decimal.Decimal `json:"startBalanceGwei"`
 	EndBalanceGwei       decimal.Decimal `json:"endBalanceGwei"`
 	DepositsSumGwei      decimal.Decimal `json:"depositsSumGwei"`
+	WithdrawalsSumGwei   decimal.Decimal `json:"withdrawalsSumGwei"`
 	ConsensusRewardsGwei decimal.Decimal `json:"consensusRewardsGwei"`
 	TxFeesSumWei         decimal.Decimal `json:"txFeesSumWei"`
 	TotalRewardsWei      decimal.Decimal `json:"totalRewardsWei"`
@@ -58,6 +60,7 @@ type Validator struct {
 	StartBalanceGwei     phase0.Gwei
 	EndBalanceGwei       phase0.Gwei
 	DepositsSumGwei      phase0.Gwei
+	WithdrawalsSumGwei   phase0.Gwei
 	TxFeesSumWei         *big.Int
 }
 
@@ -156,6 +159,15 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 func GetValidators(ctx context.Context, client *http.Service, stateID string) (map[phase0.ValidatorIndex]*v1.Validator, error) {
 	validatorsCacheMu.Lock()
 	defer validatorsCacheMu.Unlock()
+
+	if validatorsCache == nil {
+		c, err := lru.New(2)
+		if err != nil {
+			return nil, err
+		}
+		validatorsCache = c
+	}
+
 	key := fmt.Sprintf("%s:%s", client.Address(), stateID)
 	val, found := validatorsCache.Get(key)
 	if found {
@@ -169,15 +181,50 @@ func GetValidators(ctx context.Context, client *http.Service, stateID string) (m
 	return vals, nil
 }
 
-func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, map[uint64]*Day, error) {
-	if validatorsCache == nil {
-		c, err := lru.New(2)
-		if err != nil {
-			return nil, nil, err
-		}
-		validatorsCache = c
-	}
+type BlockData struct {
+	ProposerIndex phase0.ValidatorIndex
+	Transactions  []bellatrix.Transaction
+	BaseFeePerGas [32]byte
+	Deposits      []*phase0.Deposit
+	GasUsed       uint64
+	GasLimit      uint64
+	Withdrawals   []*capella.Withdrawal
+	BlockNumber   uint64
+}
 
+func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
+	d := &BlockData{}
+	switch block.Version {
+	case spec.DataVersionPhase0:
+		d.Deposits = block.Phase0.Message.Body.Deposits
+		d.ProposerIndex = block.Phase0.Message.ProposerIndex
+	case spec.DataVersionAltair:
+		d.Deposits = block.Altair.Message.Body.Deposits
+		d.ProposerIndex = block.Altair.Message.ProposerIndex
+	case spec.DataVersionBellatrix:
+		d.Deposits = block.Bellatrix.Message.Body.Deposits
+		d.ProposerIndex = block.Bellatrix.Message.ProposerIndex
+		d.GasUsed = block.Bellatrix.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Bellatrix.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Bellatrix.Message.Body.ExecutionPayload.BaseFeePerGas
+		d.BlockNumber = block.Bellatrix.Message.Body.ExecutionPayload.BlockNumber
+		d.Transactions = block.Bellatrix.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionCapella:
+		d.Deposits = block.Capella.Message.Body.Deposits
+		d.ProposerIndex = block.Capella.Message.ProposerIndex
+		d.GasUsed = block.Capella.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Capella.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Capella.Message.Body.ExecutionPayload.BaseFeePerGas
+		d.Withdrawals = block.Capella.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Capella.Message.Body.ExecutionPayload.BlockNumber
+		d.Transactions = block.Capella.Message.Body.ExecutionPayload.Transactions
+	default:
+		return nil, fmt.Errorf("unknown block version: %v", block.Version)
+	}
+	return d, nil
+}
+
+func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, map[uint64]*Day, error) {
 	gethRpcClient, err := gethRPC.Dial(elAddress)
 	if err != nil {
 		return nil, nil, err
@@ -365,91 +412,76 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			if block == nil {
 				return nil
 			}
-			var deposits []*phase0.Deposit
-			var exec *bellatrix.ExecutionPayload
-			var proposerIndex phase0.ValidatorIndex
-			switch block.Version {
-			case spec.DataVersionPhase0:
-				deposits = block.Phase0.Message.Body.Deposits
-				proposerIndex = block.Phase0.Message.ProposerIndex
-			case spec.DataVersionAltair:
-				deposits = block.Altair.Message.Body.Deposits
-				proposerIndex = block.Altair.Message.ProposerIndex
-			case spec.DataVersionBellatrix:
-				deposits = block.Bellatrix.Message.Body.Deposits
-				proposerIndex = block.Bellatrix.Message.ProposerIndex
-				exec = block.Bellatrix.Message.Body.ExecutionPayload
-			default:
-				return fmt.Errorf("unknown block version for block %v: %v", i, block.Version)
+			blockData, err := GetBlockData(block)
+			if err != nil {
+				return fmt.Errorf("error getting blockData for block at slot %v: %w", i, err)
 			}
 
-			if exec != nil {
-				// only add tx fees of blocks that have been proposed from validators that have been active the whole day
-				v, exists := validatorsByIndex[proposerIndex]
-				if exists && len(exec.Transactions) > 0 {
-					txHashes := []common.Hash{}
-					for _, tx := range exec.Transactions {
-						var decTx gethTypes.Transaction
-						err := decTx.UnmarshalBinary([]byte(tx))
-						if err != nil {
-							return err
-						}
-						txHashes = append(txHashes, decTx.Hash())
-					}
-
-					var txReceipts []*TxReceipt
-					for j := 0; j < 10; j++ { // retry up to 10 times
-						ctx, cancel := context.WithTimeout(gCtx, GetExecTimeout())
-						txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
-						if err == nil {
-							cancel()
-							break
-						} else {
-							log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
-							time.Sleep(time.Duration(j) * time.Second)
-						}
-						cancel()
-					}
+			v, exists := validatorsByIndex[blockData.ProposerIndex]
+			// only calculate for validators that have been active the whole day
+			if exists && len(blockData.Transactions) > 0 {
+				txHashes := []common.Hash{}
+				for _, tx := range blockData.Transactions {
+					var decTx gethTypes.Transaction
+					err := decTx.UnmarshalBinary([]byte(tx))
 					if err != nil {
-						return fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", i, err)
+						return err
 					}
+					txHashes = append(txHashes, decTx.Hash())
+				}
 
-					totalTxFee := big.NewInt(0)
-					for _, r := range txReceipts {
-						if r.EffectiveGasPrice == nil {
-							return fmt.Errorf("no EffectiveGasPrice for slot %v: %v", i, txHashes)
-						}
-						txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
-						totalTxFee.Add(totalTxFee, txFee)
+				var txReceipts []*TxReceipt
+				for j := 0; j < 10; j++ { // retry up to 10 times
+					ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
+					txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
+					if err == nil {
+						cancel()
+						break
+					} else {
+						log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
+						time.Sleep(time.Duration(j) * time.Second)
 					}
+					cancel()
+				}
+				if err != nil {
+					return fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", i, err)
+				}
 
-					// base fee per gas is stored little-endian but we need it
-					// big-endian for big.Int.
-					var baseFeePerGasBEBytes [32]byte
-					for i := 0; i < 32; i++ {
-						baseFeePerGasBEBytes[i] = exec.BaseFeePerGas[32-1-i]
+				totalTxFee := big.NewInt(0)
+				for _, r := range txReceipts {
+					if r.EffectiveGasPrice == nil {
+						return fmt.Errorf("no EffectiveGasPrice for slot %v: %v", i, txHashes)
 					}
-					baseFeePerGas := new(big.Int).SetBytes(baseFeePerGasBEBytes[:])
-					burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(exec.GasUsed))
+					txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
+					totalTxFee.Add(totalTxFee, txFee)
+				}
 
-					totalTxFee.Sub(totalTxFee, burntFee)
+				// base fee per gas is stored little-endian but we need it
+				// big-endian for big.Int.
+				var baseFeePerGasBEBytes [32]byte
+				for i := 0; i < 32; i++ {
+					baseFeePerGasBEBytes[i] = blockData.BaseFeePerGas[32-1-i]
+				}
+				baseFeePerGas := new(big.Int).SetBytes(baseFeePerGasBEBytes[:])
+				burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(blockData.GasUsed))
 
-					validatorsMu.Lock()
-					v.TxFeesSumWei.Add(v.TxFeesSumWei, totalTxFee)
-					validatorsMu.Unlock()
+				totalTxFee.Sub(totalTxFee, burntFee)
 
-					if GetDebugLevel() > 1 {
-						log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v, burnt: %v\n", i, exec.BlockNumber, baseFeePerGas, totalTxFee, burntFee)
-					}
+				validatorsMu.Lock()
+				v.TxFeesSumWei.Add(v.TxFeesSumWei, totalTxFee)
+				validatorsMu.Unlock()
+
+				if GetDebugLevel() > 1 {
+					log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v, burnt: %v\n", i, blockData.BlockNumber, baseFeePerGas, totalTxFee, burntFee)
 				}
 			}
 
 			validatorsMu.Lock()
 			defer validatorsMu.Unlock()
-			for _, d := range deposits {
+			for _, d := range blockData.Deposits {
 				v, exists := validatorsByPubkey[d.Data.PublicKey]
 				if !exists {
-					// only add deposits of validators that have been active the whole day
+					// only calculate for validators that have been active the whole day
 					continue
 				}
 				msg := &ethpb.Deposit_Data{
@@ -470,6 +502,14 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 				}
 				v.DepositsSumGwei += d.Data.Amount
 			}
+			for _, d := range blockData.Withdrawals {
+				v, exists := validatorsByIndex[d.ValidatorIndex]
+				if !exists {
+					// only calculate for validators that have been active the whole day
+					continue
+				}
+				v.WithdrawalsSumGwei += d.Amount
+			}
 
 			return nil
 		})
@@ -482,6 +522,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	var totalStartBalanceGwei phase0.Gwei
 	var totalEndBalanceGwei phase0.Gwei
 	var totalDepositsSumGwei phase0.Gwei
+	var totalWithdrawalsSumGwei phase0.Gwei
 	totalTxFeesSumWei := new(big.Int)
 
 	ethstorePerValidator := make(map[uint64]*Day, len(validatorsByIndex))
@@ -491,9 +532,10 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		totalStartBalanceGwei += v.StartBalanceGwei
 		totalEndBalanceGwei += v.EndBalanceGwei
 		totalDepositsSumGwei += v.DepositsSumGwei
+		totalWithdrawalsSumGwei += v.WithdrawalsSumGwei
 		totalTxFeesSumWei.Add(totalTxFeesSumWei, v.TxFeesSumWei)
 
-		validatorConsensusRewardsGwei := decimal.NewFromInt(int64(v.EndBalanceGwei) - int64(v.StartBalanceGwei) - int64(v.DepositsSumGwei))
+		validatorConsensusRewardsGwei := decimal.NewFromInt(int64(v.EndBalanceGwei) - int64(v.StartBalanceGwei) - int64(v.DepositsSumGwei) + int64(v.WithdrawalsSumGwei))
 		validatorRewardsWei := decimal.NewFromBigInt(v.TxFeesSumWei, 0).Add(validatorConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
 
 		ethstorePerValidator[uint64(index)] = &Day{
@@ -509,11 +551,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			TxFeesSumWei:         decimal.NewFromBigInt(v.TxFeesSumWei, 0),
 			ConsensusRewardsGwei: validatorConsensusRewardsGwei,
 			TotalRewardsWei:      validatorRewardsWei,
+			WithdrawalsSumGwei:   decimal.NewFromInt(int64(v.WithdrawalsSumGwei)),
 		}
-
 	}
 
-	totalConsensusRewardsGwei := decimal.NewFromInt(int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei))
+	totalConsensusRewardsGwei := decimal.NewFromInt(int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei) + int64(totalWithdrawalsSumGwei))
 	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 0).Add(totalConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
 
 	ethstoreDay := &Day{
@@ -528,6 +570,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		DepositsSumGwei:      decimal.NewFromInt(int64(totalDepositsSumGwei)),
 		TxFeesSumWei:         decimal.NewFromBigInt(totalTxFeesSumWei, 0),
 		ConsensusRewardsGwei: totalConsensusRewardsGwei,
+		WithdrawalsSumGwei:   decimal.NewFromInt(int64(totalWithdrawalsSumGwei)),
 		TotalRewardsWei:      totalRewardsWei,
 	}
 
