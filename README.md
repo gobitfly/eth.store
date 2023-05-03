@@ -1,4 +1,5 @@
-![image](https://user-images.githubusercontent.com/26490734/174131682-598758e0-1b5d-4b8d-8995-26cab3f65f22.png)
+![ethstore](https://user-images.githubusercontent.com/26490734/235898840-ffba747a-69ac-4750-8517-c0b3ffcb8459.png)
+
 
 ETH.STORE (Ether Staking Offered Rate) represents the average financial return validators on the Ethereum network have achieved in a 24-hour period.
 
