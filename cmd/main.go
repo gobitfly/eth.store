@@ -20,16 +20,17 @@ import (
 )
 
 var opts struct {
-	Days        string
-	Validators  string
-	ConsAddress string
-	ConsTimeout time.Duration
-	ExecAddress string
-	ExecTimeout time.Duration
-	Json        bool
-	JsonFile    string
-	DebugLevel  uint64
-	Version     bool
+	Days         string
+	Validators   string
+	ConsAddress  string
+	ConsTimeout  time.Duration
+	ExecAddress  string
+	ExecTimeout  time.Duration
+	Json         bool
+	JsonFile     string
+	DebugLevel   uint64
+	Version      bool
+	ReceiptsMode int
 }
 
 func main() {
@@ -42,11 +43,16 @@ func main() {
 	flag.StringVar(&opts.JsonFile, "json.file", "", "path to file to write results into, only missing days will be added")
 	flag.Uint64Var(&opts.DebugLevel, "debug", 0, "set debug-level (higher level will increase verbosity)")
 	flag.BoolVar(&opts.Version, "version", false, "print version and exit")
+	flag.IntVar(&opts.ReceiptsMode, "receipts-mode", 0, "mode to use for fetching tx receipts, 0 = eth_getTransactionReceipt, 1 = eth_getBlockReceipts")
 	flag.Parse()
 
 	if opts.Version {
 		fmt.Println(version.Version)
 		return
+	}
+
+	if opts.ReceiptsMode != 0 && opts.ReceiptsMode != 1 {
+		log.Fatalf("invalid receipts mode provided, can only be 0 or 1")
 	}
 
 	ethstore.SetConsTimeout(opts.ConsTimeout)
@@ -145,7 +151,7 @@ func main() {
 				logEthstoreDay(d)
 				continue
 			}
-			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10)
+			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10, opts.ReceiptsMode)
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
@@ -168,7 +174,7 @@ func main() {
 	} else {
 		result := []*ethstore.Day{}
 		for _, dd := range days {
-			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10)
+			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10, opts.ReceiptsMode)
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}

@@ -29,6 +29,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const RECEIPTS_MODE_BATCH = 0
+const RECEIPTS_MODE_SINGLE = 1
+
 var debugLevel = uint64(0)
 var execTimeout = time.Second * 120
 var execTimeoutMu = sync.Mutex{}
@@ -224,7 +227,7 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 	return d, nil
 }
 
-func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, map[uint64]*Day, error) {
+func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int, receiptsMode int) (*Day, map[uint64]*Day, error) {
 	gethRpcClient, err := gethRPC.Dial(elAddress)
 	if err != nil {
 		return nil, nil, err
@@ -428,13 +431,25 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 				var txReceipts []*TxReceipt
 				for j := 0; j < 10; j++ { // retry up to 10 times
 					ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
-					txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
-					if err == nil {
-						cancel()
-						break
-					} else {
-						log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
-						time.Sleep(time.Duration(j) * time.Second)
+
+					if receiptsMode == RECEIPTS_MODE_BATCH {
+						txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
+						if err == nil {
+							cancel()
+							break
+						} else {
+							log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
+						}
+					} else if receiptsMode == RECEIPTS_MODE_SINGLE {
+						txReceipts, err = requestReceipts(ctx, gethRpcClient, blockData.BlockNumber)
+						if err == nil {
+							cancel()
+							break
+						} else {
+							log.Printf("error doing requestReceipts for slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
+						}
 					}
 					cancel()
 				}
@@ -600,6 +615,16 @@ func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashe
 		if e != nil {
 			return nil, fmt.Errorf("error when fetching tx-receipts: %w", e)
 		}
+	}
+	return txReceipts, nil
+}
+
+func requestReceipts(ctx context.Context, elClient *gethRPC.Client, blockNumber uint64) ([]*TxReceipt, error) {
+	txReceipts := make([]*TxReceipt, 0)
+
+	ioErr := elClient.CallContext(ctx, &txReceipts, "eth_getBlockReceipts", blockNumber)
+	if ioErr != nil {
+		return nil, fmt.Errorf("io-error when fetching tx-receipts: %w", ioErr)
 	}
 	return txReceipts, nil
 }

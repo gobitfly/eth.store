@@ -219,7 +219,7 @@ func TestEthstore(t *testing.T) {
 	defer elServer.Close()
 
 	// SetDebugLevel(1)
-	day, _, err := Calculate(context.Background(), bnServer.URL, elServer.URL, "10", 1)
+	day, _, err := Calculate(context.Background(), bnServer.URL, elServer.URL, "10", 1, RECEIPTS_MODE_BATCH)
 	if err != nil {
 		t.Error(err)
 	}
