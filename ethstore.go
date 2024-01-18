@@ -2,6 +2,7 @@ package ethstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/api"
 	v1 "github.com/attestantio/go-eth2-client/api/v1"
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
@@ -105,11 +107,11 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 		return 0, err
 	}
 	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx)
+	apiSpec, err := client.Spec(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -120,12 +122,12 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	h, err := client.BeaconBlockHeader(ctx, "finalized")
+	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
 		return 0, err
 	}
 
-	day := uint64(h.Header.Message.Slot)/slotsPerDay - 1
+	day := uint64(h.Data.Header.Message.Slot)/slotsPerDay - 1
 	return day, nil
 }
 
@@ -135,11 +137,11 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 		return 0, err
 	}
 	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx)
+	apiSpec, err := client.Spec(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -150,12 +152,12 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	h, err := client.BeaconBlockHeader(ctx, "finalized")
+	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
 		return 0, err
 	}
 
-	day := uint64(h.Header.Message.Slot) / slotsPerDay
+	day := uint64(h.Data.Header.Message.Slot) / slotsPerDay
 	return day, nil
 }
 
@@ -176,12 +178,12 @@ func GetValidators(ctx context.Context, client *http.Service, stateID string) (m
 	if found {
 		return val.(map[phase0.ValidatorIndex]*v1.Validator), nil
 	}
-	vals, err := client.Validators(ctx, stateID, nil)
+	vals, err := client.Validators(ctx, &api.ValidatorsOpts{State: stateID})
 	if err != nil {
 		return nil, fmt.Errorf("error getting validators for slot %v: %w", stateID, err)
 	}
-	validatorsCache.Add(key, vals)
-	return vals, nil
+	validatorsCache.Add(key, vals.Data)
+	return vals.Data, nil
 }
 
 type BlockData struct {
@@ -221,6 +223,15 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.Withdrawals = block.Capella.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Capella.Message.Body.ExecutionPayload.BlockNumber
 		d.Transactions = block.Capella.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionDeneb:
+		d.Deposits = block.Deneb.Message.Body.Deposits
+		d.ProposerIndex = block.Deneb.Message.ProposerIndex
+		d.GasUsed = block.Deneb.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Deneb.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Deneb.Message.Body.ExecutionPayload.BaseFeePerGas.Bytes32()
+		d.Withdrawals = block.Deneb.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Deneb.Message.Body.ExecutionPayload.BlockNumber
+		d.Transactions = block.Deneb.Message.Body.ExecutionPayload.Transactions
 	default:
 		return nil, fmt.Errorf("unknown block version: %v", block.Version)
 	}
@@ -239,12 +250,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	}
 	client := service.(*http.Service)
 
-	apiSpec, err := client.Spec(ctx)
+	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("error getting spec: %w", err)
 	}
 
-	genesisForkVersionIf, exists := apiSpec["GENESIS_FORK_VERSION"]
+	genesisForkVersionIf, exists := apiSpec.Data["GENESIS_FORK_VERSION"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined GENESIS_FORK_VERSION in spec")
 	}
@@ -253,7 +264,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, fmt.Errorf("invalid format of GENESIS_FORK_VERSION in spec")
 	}
 
-	domainDepositIf, exists := apiSpec["DOMAIN_DEPOSIT"]
+	domainDepositIf, exists := apiSpec.Data["DOMAIN_DEPOSIT"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined DOMAIN_DEPOSIT in spec")
 	}
@@ -268,7 +279,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, err
 	}
 
-	slotsPerEpochIf, exists := apiSpec["SLOTS_PER_EPOCH"]
+	slotsPerEpochIf, exists := apiSpec.Data["SLOTS_PER_EPOCH"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined SLOTS_PER_EPOCH in spec")
 	}
@@ -277,7 +288,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, fmt.Errorf("invalid format of SLOTS_PER_EPOCH in spec")
 	}
 
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -289,11 +300,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
+	//finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
+	finalizedHeader, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
 		return nil, nil, err
 	}
-	finalizedSlot := uint64(finalizedHeader.Header.Message.Slot)
+	finalizedSlot := uint64(finalizedHeader.Data.Header.Message.Slot)
 	finalizedDay := finalizedSlot/slotsPerDay - 1
 
 	var day uint64
@@ -392,21 +404,31 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
+			var blockRes *api.Response[*spec.VersionedSignedBeaconBlock]
 			var block *spec.VersionedSignedBeaconBlock
 			var err error
 			for j := 0; j < 10; j++ { // retry up to 10 times on failure
-				block, err = client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
-
+				blockRes, err = client.SignedBeaconBlock(ctx, &api.SignedBeaconBlockOpts{Block: fmt.Sprintf("%d", i)})
 				if err == nil {
 					break
 				} else {
-					log.Printf("error retrieving beacon block at slot %v: %v", i, err)
-					time.Sleep(time.Duration(j) * time.Second)
+					var apiErr *api.Error
+					if errors.As(err, &apiErr) {
+						switch apiErr.StatusCode {
+						case 404:
+							// block not found
+							return nil
+						default:
+							log.Printf("error retrieving beacon block at slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
+						}
+					}
 				}
 			}
 			if err != nil {
 				return fmt.Errorf("error getting block %v: %w", i, err)
 			}
+			block = blockRes.Data
 			if block == nil {
 				return nil
 			}
@@ -460,7 +482,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 				totalTxFee := big.NewInt(0)
 				for _, r := range txReceipts {
 					if r.EffectiveGasPrice == nil {
-						return fmt.Errorf("no EffectiveGasPrice for slot %v: %v", i, txHashes)
+						return fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", i, *r)
 					}
 					txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
 					totalTxFee.Add(totalTxFee, txFee)
