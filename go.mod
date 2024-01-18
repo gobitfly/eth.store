@@ -1,6 +1,6 @@
 module github.com/gobitfly/eth.store
 
-go 1.18
+go 1.20
 
 require (
 	github.com/attestantio/go-eth2-client v0.19.9

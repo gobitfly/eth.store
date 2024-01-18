@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"sort"
@@ -130,7 +129,7 @@ func main() {
 		fileDays := []*ethstore.Day{}
 		_, err := os.Stat(opts.JsonFile)
 		if err == nil {
-			fileDaysBytes, err := ioutil.ReadFile(opts.JsonFile)
+			fileDaysBytes, err := os.ReadFile(opts.JsonFile)
 			if err != nil {
 				log.Fatalf("error reading file: %v", err)
 			}
@@ -163,7 +162,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("error marshaling ethstore: %v", err)
 			}
-			err = ioutil.WriteFile(opts.JsonFile, fileDaysJson, 0644)
+			err = os.WriteFile(opts.JsonFile, fileDaysJson, 0644)
 			if err != nil {
 				log.Fatalf("error writing ethstore to file: %v", err)
 			}
