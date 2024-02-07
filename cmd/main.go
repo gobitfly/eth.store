@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	ethstore "github.com/gobitfly/eth.store"
-	"github.com/gobitfly/eth.store/version"
+	ethstore "github.com/SergeevDmitry/eth.store"
+	"github.com/SergeevDmitry/eth.store/version"
 	"github.com/shopspring/decimal"
 )
 

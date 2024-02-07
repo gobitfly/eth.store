@@ -1,4 +1,4 @@
-module github.com/gobitfly/eth.store
+module github.com/SergeevDmitry/eth.store
 
 go 1.20
 
