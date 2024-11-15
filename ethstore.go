@@ -2,6 +2,7 @@ package ethstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/api"
 	v1 "github.com/attestantio/go-eth2-client/api/v1"
 	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
@@ -21,13 +23,16 @@ import (
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	gethRPC "github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
-	"github.com/prysmaticlabs/prysm/v3/beacon-chain/core/signing"
-	"github.com/prysmaticlabs/prysm/v3/contracts/deposit"
-	ethpb "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
+	"github.com/prysmaticlabs/prysm/v5/beacon-chain/core/signing"
+	"github.com/prysmaticlabs/prysm/v5/contracts/deposit"
+	ethpb "github.com/prysmaticlabs/prysm/v5/proto/prysm/v1alpha1"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
 )
+
+const RECEIPTS_MODE_BATCH = 0
+const RECEIPTS_MODE_SINGLE = 1
 
 var debugLevel = uint64(0)
 var execTimeout = time.Second * 120
@@ -102,11 +107,11 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 		return 0, err
 	}
 	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx)
+	apiSpec, err := client.Spec(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -117,12 +122,12 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	h, err := client.BeaconBlockHeader(ctx, "finalized")
+	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
 		return 0, err
 	}
 
-	day := uint64(h.Header.Message.Slot)/slotsPerDay - 1
+	day := uint64(h.Data.Header.Message.Slot)/slotsPerDay - 1
 	return day, nil
 }
 
@@ -132,11 +137,11 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 		return 0, err
 	}
 	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx)
+	apiSpec, err := client.Spec(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -147,12 +152,12 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	h, err := client.BeaconBlockHeader(ctx, "finalized")
+	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
 		return 0, err
 	}
 
-	day := uint64(h.Header.Message.Slot) / slotsPerDay
+	day := uint64(h.Data.Header.Message.Slot) / slotsPerDay
 	return day, nil
 }
 
@@ -173,18 +178,19 @@ func GetValidators(ctx context.Context, client *http.Service, stateID string) (m
 	if found {
 		return val.(map[phase0.ValidatorIndex]*v1.Validator), nil
 	}
-	vals, err := client.Validators(ctx, stateID, nil)
+	vals, err := client.Validators(ctx, &api.ValidatorsOpts{State: stateID})
 	if err != nil {
 		return nil, fmt.Errorf("error getting validators for slot %v: %w", stateID, err)
 	}
-	validatorsCache.Add(key, vals)
-	return vals, nil
+	validatorsCache.Add(key, vals.Data)
+	return vals.Data, nil
 }
 
 type BlockData struct {
+	Version       spec.DataVersion
 	ProposerIndex phase0.ValidatorIndex
 	Transactions  []bellatrix.Transaction
-	BaseFeePerGas [32]byte
+	BaseFeePerGas *big.Int
 	Deposits      []*phase0.Deposit
 	GasUsed       uint64
 	GasLimit      uint64
@@ -194,6 +200,7 @@ type BlockData struct {
 
 func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 	d := &BlockData{}
+	d.Version = block.Version
 	switch block.Version {
 	case spec.DataVersionPhase0:
 		d.Deposits = block.Phase0.Message.Body.Deposits
@@ -206,7 +213,11 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.ProposerIndex = block.Bellatrix.Message.ProposerIndex
 		d.GasUsed = block.Bellatrix.Message.Body.ExecutionPayload.GasUsed
 		d.GasLimit = block.Bellatrix.Message.Body.ExecutionPayload.GasLimit
-		d.BaseFeePerGas = block.Bellatrix.Message.Body.ExecutionPayload.BaseFeePerGas
+		baseFeePerGasBEBytes := make([]byte, len(block.Bellatrix.Message.Body.ExecutionPayload.BaseFeePerGas))
+		for i := 0; i < 32; i++ {
+			baseFeePerGasBEBytes[i] = block.Bellatrix.Message.Body.ExecutionPayload.BaseFeePerGas[32-1-i]
+		}
+		d.BaseFeePerGas = new(big.Int).SetBytes(baseFeePerGasBEBytes)
 		d.BlockNumber = block.Bellatrix.Message.Body.ExecutionPayload.BlockNumber
 		d.Transactions = block.Bellatrix.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionCapella:
@@ -214,17 +225,30 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.ProposerIndex = block.Capella.Message.ProposerIndex
 		d.GasUsed = block.Capella.Message.Body.ExecutionPayload.GasUsed
 		d.GasLimit = block.Capella.Message.Body.ExecutionPayload.GasLimit
-		d.BaseFeePerGas = block.Capella.Message.Body.ExecutionPayload.BaseFeePerGas
+		baseFeePerGasBEBytes := make([]byte, len(block.Capella.Message.Body.ExecutionPayload.BaseFeePerGas))
+		for i := 0; i < 32; i++ {
+			baseFeePerGasBEBytes[i] = block.Capella.Message.Body.ExecutionPayload.BaseFeePerGas[32-1-i]
+		}
+		d.BaseFeePerGas = new(big.Int).SetBytes(baseFeePerGasBEBytes)
 		d.Withdrawals = block.Capella.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Capella.Message.Body.ExecutionPayload.BlockNumber
 		d.Transactions = block.Capella.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionDeneb:
+		d.Deposits = block.Deneb.Message.Body.Deposits
+		d.ProposerIndex = block.Deneb.Message.ProposerIndex
+		d.GasUsed = block.Deneb.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Deneb.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Deneb.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
+		d.Withdrawals = block.Deneb.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Deneb.Message.Body.ExecutionPayload.BlockNumber
+		d.Transactions = block.Deneb.Message.Body.ExecutionPayload.Transactions
 	default:
 		return nil, fmt.Errorf("unknown block version: %v", block.Version)
 	}
 	return d, nil
 }
 
-func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, map[uint64]*Day, error) {
+func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int, receiptsMode int) (*Day, map[uint64]*Day, error) {
 	gethRpcClient, err := gethRPC.Dial(elAddress)
 	if err != nil {
 		return nil, nil, err
@@ -236,12 +260,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	}
 	client := service.(*http.Service)
 
-	apiSpec, err := client.Spec(ctx)
+	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("error getting spec: %w", err)
 	}
 
-	genesisForkVersionIf, exists := apiSpec["GENESIS_FORK_VERSION"]
+	genesisForkVersionIf, exists := apiSpec.Data["GENESIS_FORK_VERSION"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined GENESIS_FORK_VERSION in spec")
 	}
@@ -250,7 +274,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, fmt.Errorf("invalid format of GENESIS_FORK_VERSION in spec")
 	}
 
-	domainDepositIf, exists := apiSpec["DOMAIN_DEPOSIT"]
+	domainDepositIf, exists := apiSpec.Data["DOMAIN_DEPOSIT"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined DOMAIN_DEPOSIT in spec")
 	}
@@ -265,7 +289,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, err
 	}
 
-	slotsPerEpochIf, exists := apiSpec["SLOTS_PER_EPOCH"]
+	slotsPerEpochIf, exists := apiSpec.Data["SLOTS_PER_EPOCH"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined SLOTS_PER_EPOCH in spec")
 	}
@@ -274,7 +298,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, fmt.Errorf("invalid format of SLOTS_PER_EPOCH in spec")
 	}
 
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -286,11 +310,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
+	//finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
+	finalizedHeader, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
 		return nil, nil, err
 	}
-	finalizedSlot := uint64(finalizedHeader.Header.Message.Slot)
+	finalizedSlot := uint64(finalizedHeader.Data.Header.Message.Slot)
 	finalizedDay := finalizedSlot/slotsPerDay - 1
 
 	var day uint64
@@ -389,21 +414,31 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
+			var blockRes *api.Response[*spec.VersionedSignedBeaconBlock]
 			var block *spec.VersionedSignedBeaconBlock
 			var err error
 			for j := 0; j < 10; j++ { // retry up to 10 times on failure
-				block, err = client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
-
+				blockRes, err = client.SignedBeaconBlock(ctx, &api.SignedBeaconBlockOpts{Block: fmt.Sprintf("%d", i)})
 				if err == nil {
 					break
 				} else {
-					log.Printf("error retrieving beacon block at slot %v: %v", i, err)
-					time.Sleep(time.Duration(j) * time.Second)
+					var apiErr *api.Error
+					if errors.As(err, &apiErr) {
+						switch apiErr.StatusCode {
+						case 404:
+							// block not found
+							return nil
+						default:
+							log.Printf("error retrieving beacon block at slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
+						}
+					}
 				}
 			}
 			if err != nil {
 				return fmt.Errorf("error getting block %v: %w", i, err)
 			}
+			block = blockRes.Data
 			if block == nil {
 				return nil
 			}
@@ -428,13 +463,25 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 				var txReceipts []*TxReceipt
 				for j := 0; j < 10; j++ { // retry up to 10 times
 					ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
-					txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
-					if err == nil {
-						cancel()
-						break
-					} else {
-						log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
-						time.Sleep(time.Duration(j) * time.Second)
+
+					if receiptsMode == RECEIPTS_MODE_BATCH {
+						txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
+						if err == nil {
+							cancel()
+							break
+						} else {
+							log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
+						}
+					} else if receiptsMode == RECEIPTS_MODE_SINGLE {
+						txReceipts, err = requestReceipts(ctx, gethRpcClient, blockData.BlockNumber)
+						if err == nil {
+							cancel()
+							break
+						} else {
+							log.Printf("error doing requestReceipts for slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
+						}
 					}
 					cancel()
 				}
@@ -445,19 +492,13 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 				totalTxFee := big.NewInt(0)
 				for _, r := range txReceipts {
 					if r.EffectiveGasPrice == nil {
-						return fmt.Errorf("no EffectiveGasPrice for slot %v: %v", i, txHashes)
+						return fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", i, *r)
 					}
 					txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
 					totalTxFee.Add(totalTxFee, txFee)
 				}
 
-				// base fee per gas is stored little-endian but we need it
-				// big-endian for big.Int.
-				var baseFeePerGasBEBytes [32]byte
-				for i := 0; i < 32; i++ {
-					baseFeePerGasBEBytes[i] = blockData.BaseFeePerGas[32-1-i]
-				}
-				baseFeePerGas := new(big.Int).SetBytes(baseFeePerGasBEBytes[:])
+				baseFeePerGas := blockData.BaseFeePerGas
 				burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(blockData.GasUsed))
 
 				totalTxFee.Sub(totalTxFee, burntFee)
@@ -600,6 +641,16 @@ func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashe
 		if e != nil {
 			return nil, fmt.Errorf("error when fetching tx-receipts: %w", e)
 		}
+	}
+	return txReceipts, nil
+}
+
+func requestReceipts(ctx context.Context, elClient *gethRPC.Client, blockNumber uint64) ([]*TxReceipt, error) {
+	txReceipts := make([]*TxReceipt, 0)
+
+	ioErr := elClient.CallContext(ctx, &txReceipts, "eth_getBlockReceipts", blockNumber)
+	if ioErr != nil {
+		return nil, fmt.Errorf("io-error when fetching tx-receipts: %w", ioErr)
 	}
 	return txReceipts, nil
 }
