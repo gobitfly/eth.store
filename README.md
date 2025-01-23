@@ -9,6 +9,8 @@ ETH.STORE (Ether Staking Offered Rate) represents the average financial return v
 
 ```bash
 # build and install binary from source via go
+git clone github.com/gobitfly/eth.store
+cd eth.store
 go install github.com/gobitfly/eth.store
 
 eth.store -h
