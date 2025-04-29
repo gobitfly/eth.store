@@ -1,11 +1,16 @@
 package ethstore
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"math/big"
+	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -13,7 +18,7 @@ import (
 
 	"github.com/attestantio/go-eth2-client/api"
 	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/http"
+	ethHttp "github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
@@ -35,6 +40,7 @@ const RECEIPTS_MODE_BATCH = 0
 const RECEIPTS_MODE_SINGLE = 1
 
 var debugLevel = uint64(0)
+var beaconchainApiClient = NewBeaconchainApiClient("")
 var execTimeout = time.Second * 120
 var execTimeoutMu = sync.Mutex{}
 var consTimeout = time.Second * 120
@@ -89,6 +95,10 @@ func SetExecTimeout(dur time.Duration) {
 	execTimeout = dur
 }
 
+func SetBeaconchainApiKey(apiKey string) {
+	beaconchainApiClient.SetApiKey(apiKey)
+}
+
 func GetConsTimeout() time.Duration {
 	consTimeoutMu.Lock()
 	defer consTimeoutMu.Unlock()
@@ -102,14 +112,14 @@ func GetExecTimeout() time.Duration {
 }
 
 func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
-	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	service, err := ethHttp.New(ctx, ethHttp.WithAddress(address), ethHttp.WithTimeout(GetConsTimeout()), ethHttp.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return 0, err
 	}
-	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx, nil)
+	client := service.(*ethHttp.Service)
+	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.Spec: %w", err)
 	}
 	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
@@ -124,7 +134,7 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 
 	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.BeaconBlockHeader: %w", err)
 	}
 
 	day := uint64(h.Data.Header.Message.Slot)/slotsPerDay - 1
@@ -132,14 +142,14 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 }
 
 func GetHeadDay(ctx context.Context, address string) (uint64, error) {
-	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	service, err := ethHttp.New(ctx, ethHttp.WithAddress(address), ethHttp.WithTimeout(GetConsTimeout()), ethHttp.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return 0, err
 	}
-	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx, nil)
+	client := service.(*ethHttp.Service)
+	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.Spec: %w", err)
 	}
 	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
@@ -152,16 +162,16 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
+	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "head"})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.BeaconBlockHeader: %w", err)
 	}
 
 	day := uint64(h.Data.Header.Message.Slot) / slotsPerDay
 	return day, nil
 }
 
-func GetValidators(ctx context.Context, client *http.Service, stateID string) (map[phase0.ValidatorIndex]*v1.Validator, error) {
+func GetValidators(ctx context.Context, client *ethHttp.Service, stateID string) (map[phase0.ValidatorIndex]*v1.Validator, error) {
 	validatorsCacheMu.Lock()
 	defer validatorsCacheMu.Unlock()
 
@@ -242,6 +252,15 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.Withdrawals = block.Deneb.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Deneb.Message.Body.ExecutionPayload.BlockNumber
 		d.Transactions = block.Deneb.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionElectra:
+		d.Deposits = block.Electra.Message.Body.Deposits
+		d.ProposerIndex = block.Electra.Message.ProposerIndex
+		d.GasUsed = block.Electra.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Electra.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Electra.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
+		d.Withdrawals = block.Electra.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Electra.Message.Body.ExecutionPayload.BlockNumber
+		d.Transactions = block.Electra.Message.Body.ExecutionPayload.Transactions
 	default:
 		return nil, fmt.Errorf("unknown block version: %v", block.Version)
 	}
@@ -254,11 +273,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, err
 	}
 
-	service, err := http.New(ctx, http.WithAddress(bnAddress), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	service, err := ethHttp.New(ctx, ethHttp.WithAddress(bnAddress), ethHttp.WithTimeout(GetConsTimeout()), ethHttp.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return nil, nil, err
 	}
-	client := service.(*http.Service)
+	client := service.(*ethHttp.Service)
 
 	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
@@ -272,6 +291,26 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	genesisForkVersion, ok := genesisForkVersionIf.(phase0.Version)
 	if !ok {
 		return nil, nil, fmt.Errorf("invalid format of GENESIS_FORK_VERSION in spec")
+	}
+
+	beaconchainApiNetworkName := "mainnet"
+	switch fmt.Sprintf("%#x", genesisForkVersion) {
+	case "0x00000000":
+		beaconchainApiNetworkName = "mainnet"
+	case "0x00000064":
+		beaconchainApiNetworkName = "gnosis"
+	case "0x10000910":
+		beaconchainApiNetworkName = "hoodi"
+	}
+
+	electraForkEpoch := uint64(math.MaxUint64)
+	electraForkEpochStr, exists := apiSpec.Data["ELECTRA_FORK_EPOCH"]
+	if exists {
+		var ok bool
+		electraForkEpoch, ok = electraForkEpochStr.(uint64)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid format of ELECTRA_FORK_EPOCH in spec")
+		}
 	}
 
 	domainDepositIf, exists := apiSpec.Data["DOMAIN_DEPOSIT"]
@@ -354,11 +393,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	endTime := time.Unix(genesis.Unix()+int64(lastSlot)*int64(secondsPerSlot), 0)
 
 	if GetDebugLevel() > 0 {
-		log.Printf("DEBUG eth.store: calculating day %v (%v - %v, epochs: %v-%v, slots: %v-%v, genesis: %v, finalizedSlot: %v)\n", day, startTime, endTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis, finalizedSlot)
+		log.Printf("DEBUG eth.store: calculating day %v (%v - %v, epochs: %v-%v, slots: %v-%v, genesis: %v, finalizedSlot: %v, beaconchainApiNetworkName: %s, genesisForkVersion: %#x)\n", day, startTime, endTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis, finalizedSlot, beaconchainApiNetworkName, genesisForkVersion)
 	}
 
 	validatorsByIndex := map[phase0.ValidatorIndex]*Validator{}
-	validatorsByPubkey := map[phase0.BLSPubKey]*Validator{}
+	validatorsByPubkey := map[string]*Validator{}
+	validatorsMu := sync.Mutex{}
 
 	startValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", firstSlot))
 	if err != nil {
@@ -377,7 +417,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			TxFeesSumWei:         new(big.Int),
 		}
 		validatorsByIndex[val.Index] = vv
-		validatorsByPubkey[val.Validator.PublicKey] = vv
+		validatorsByPubkey[val.Validator.PublicKey.String()] = vv
 	}
 
 	endValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", endSlot))
@@ -393,7 +433,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		if uint64(val.Validator.ExitEpoch) < endEpoch {
 			// do not account validators that have not been active until the end of the day
 			delete(validatorsByIndex, val.Index)
-			delete(validatorsByPubkey, val.Validator.PublicKey)
+			delete(validatorsByPubkey, val.Validator.PublicKey.String())
 			continue
 		}
 		// set endBalance of validator to the balance of the first epoch of the next day
@@ -405,7 +445,77 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	g := new(errgroup.Group)
 	g.SetLimit(concurrency)
-	validatorsMu := sync.Mutex{}
+
+	if uint64(electraForkEpoch) <= lastEpoch {
+		if GetDebugLevel() > 0 {
+			log.Printf("DEBUG eth.store: fetching deposits and consolidation requests (electraForkEpoch: %v)\n", electraForkEpoch)
+		}
+		g.Go(func() error {
+			beaconchainApiGroup := new(errgroup.Group)
+			beaconchainApiGroup.SetLimit(10)
+
+			for i := firstEpoch; i <= lastEpoch; i++ {
+				i := i
+				if i == 0 {
+					continue
+				}
+				beaconchainApiGroup.Go(func() error {
+					var err error
+					depositRequests, err := beaconchainApiClient.DepositRequests(ctx, beaconchainApiNetworkName, i*slotsPerEpoch-1)
+					if err != nil {
+						return fmt.Errorf("error getting depositRequests for epoch %v (slot %v): %w", i, i*slotsPerEpoch-1, err)
+					}
+					if GetDebugLevel() > 1 {
+						for _, d := range depositRequests.Data {
+							log.Printf("DEBUG eth.store: depositRequest for epoch %v (slot %v): %v\n", i, i*slotsPerEpoch-1, d)
+						}
+					}
+					validatorsMu.Lock()
+					defer validatorsMu.Unlock()
+					for _, d := range depositRequests.Data {
+						v, exists := validatorsByPubkey[d.Pubkey]
+						if exists {
+							// only calculate for validators that have been active the whole day
+							v.DepositsSumGwei += phase0.Gwei(d.Amount)
+						}
+					}
+					return nil
+				})
+				beaconchainApiGroup.Go(func() error {
+					var err error
+					consolidationRequests, err := beaconchainApiClient.ConsolidationRequests(ctx, beaconchainApiNetworkName, i*slotsPerEpoch-1)
+					if err != nil {
+						return fmt.Errorf("error getting consolidationRequests for epoch %v (slot %v): %w", i, i*slotsPerEpoch-1, err)
+					}
+					if GetDebugLevel() > 1 {
+						for _, d := range consolidationRequests.Data {
+							log.Printf("DEBUG eth.store: consolidationRequest for epoch %v (slot %v): %v\n", i, i*slotsPerEpoch-1, d)
+						}
+					}
+					validatorsMu.Lock()
+					defer validatorsMu.Unlock()
+					for _, d := range consolidationRequests.Data {
+						vSource, exists := validatorsByIndex[phase0.ValidatorIndex(d.SourceIndex)]
+						if exists {
+							// only calculate for validators that have been active the whole day
+							vSource.WithdrawalsSumGwei += phase0.Gwei(d.AmountConsolidated)
+						}
+						vTarget, exists := validatorsByIndex[phase0.ValidatorIndex(d.TargetIndex)]
+						if exists {
+							// only calculate for validators that have been active the whole day
+							vTarget.DepositsSumGwei += phase0.Gwei(d.AmountConsolidated)
+						}
+					}
+					return nil
+				})
+			}
+
+			if err := beaconchainApiGroup.Wait(); err != nil {
+				return err
+			}
+			return nil
+		})
+	}
 
 	// get all deposits and txs of all active validators in the slot interval [startSlot,endSlot)
 	for i := firstSlot; i < endSlot; i++ {
@@ -414,6 +524,8 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
+			var blockData *BlockData
+
 			var blockRes *api.Response[*spec.VersionedSignedBeaconBlock]
 			var block *spec.VersionedSignedBeaconBlock
 			var err error
@@ -442,7 +554,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			if block == nil {
 				return nil
 			}
-			blockData, err := GetBlockData(block)
+			blockData, err = GetBlockData(block)
 			if err != nil {
 				return fmt.Errorf("error getting blockData for block at slot %v: %w", i, err)
 			}
@@ -515,7 +627,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			validatorsMu.Lock()
 			defer validatorsMu.Unlock()
 			for _, d := range blockData.Deposits {
-				v, exists := validatorsByPubkey[d.Data.PublicKey]
+				v, exists := validatorsByPubkey[d.Data.PublicKey.String()]
 				if !exists {
 					// only calculate for validators that have been active the whole day
 					continue
@@ -550,6 +662,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			return nil
 		})
 	}
+
 	if err := g.Wait(); err != nil {
 		return nil, nil, err
 	}
@@ -573,6 +686,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 		validatorConsensusRewardsGwei := decimal.NewFromInt(int64(v.EndBalanceGwei) - int64(v.StartBalanceGwei) - int64(v.DepositsSumGwei) + int64(v.WithdrawalsSumGwei))
 		validatorRewardsWei := decimal.NewFromBigInt(v.TxFeesSumWei, 0).Add(validatorConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
+
+		if validatorRewardsWei.LessThan(decimal.Zero) {
+			if GetDebugLevel() > 1 {
+				log.Printf("DEBUG eth.store: negative rewards for validator %v: %v -- %+v\n", v.Index, validatorRewardsWei, *v)
+			}
+		}
 
 		ethstorePerValidator[uint64(index)] = &Day{
 			Day:                  decimal.NewFromInt(int64(day)),
@@ -669,4 +788,198 @@ type TxReceipt struct {
 	TransactionHash   *common.Hash    `json:"transactionHash"`
 	TransactionIndex  hexutil.Uint64  `json:"transactionIndex"`
 	Type              hexutil.Uint64  `json:"type"`
+}
+
+type BeaconchainApiClient struct {
+	headers     atomic.Value
+	ratelimiter *Ratelimiter
+}
+
+func NewBeaconchainApiClient(apiKey string) *BeaconchainApiClient {
+	c := &BeaconchainApiClient{
+		headers:     atomic.Value{},
+		ratelimiter: NewRatelimiter(1),
+	}
+	c.headers.Store(map[string]string{"apikey": apiKey})
+	return c
+}
+
+func (c *BeaconchainApiClient) SetApiKey(apiKey string) {
+	c.headers.Store(map[string]string{"apikey": apiKey})
+}
+
+func (c *BeaconchainApiClient) HttpReq(ctx context.Context, method, url string, headers map[string]string, params, result interface{}) error {
+	c.ratelimiter.Wait()
+	cHeaders := c.headers.Load().(map[string]string)
+	if headers == nil {
+		headers = cHeaders
+	} else {
+		for k, v := range cHeaders {
+			headers[k] = v
+		}
+	}
+
+	var err error
+	var req *http.Request
+	if params != nil {
+		paramsJSON, err := json.Marshal(params)
+		if err != nil {
+			return HttpReqError{Url: url, HTTPError: fmt.Errorf("error marhsaling params for request: %w", err)}
+		}
+		req, err = http.NewRequestWithContext(ctx, method, url, bytes.NewBuffer(paramsJSON))
+		if err != nil {
+			return HttpReqError{Url: url, HTTPError: fmt.Errorf("error creating request with params: %w", err)}
+		}
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, url, nil)
+		if err != nil {
+			return HttpReqError{Url: url, HTTPError: fmt.Errorf("error creating request: %w", err)}
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	httpClient := &http.Client{Timeout: time.Minute}
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return HttpReqError{StatusCode: res.StatusCode, Url: url, HTTPError: err}
+	}
+
+	rlStr := res.Header.Get("ratelimit-limit")
+	if rlStr != "" {
+		rl, err := strconv.ParseInt(rlStr, 10, 64)
+		if err == nil && rl > 2 {
+			rlFloat := float64(rl) * .9 // avoid hitting the ratelimit
+			if rlFloat != c.ratelimiter.GetRate() {
+				c.ratelimiter.SetRate(rlFloat)
+				if GetDebugLevel() > 0 {
+					log.Printf("DEBUG eth.store: setting beaconchain-ratelimit: %v\n", rlFloat)
+				}
+			}
+		}
+	}
+
+	if res.StatusCode == 429 {
+		log.Printf("DEBUG eth.store: status: 429, limit: %v, remaining: %v, reset: %v, window: %v, remaining-day: %v, remaining-hour: %v, remaining-minute: %v, remaining-month: %v, remaining-second: %v\n", res.Header.Get("ratelimit-limit"), res.Header.Get("ratelimit-remaining"), res.Header.Get("ratelimit-reset"), res.Header.Get("ratelimit-window"), res.Header.Get("x-ratelimit-remaining-day"), res.Header.Get("x-ratelimit-remaining-hour"), res.Header.Get("x-ratelimit-remaining-minute"), res.Header.Get("x-ratelimit-remaining-month"), res.Header.Get("x-ratelimit-remaining-second"))
+	}
+
+	defer res.Body.Close()
+	if res.StatusCode > 299 {
+		body, _ := io.ReadAll(res.Body)
+		return HttpReqError{StatusCode: res.StatusCode, Url: url, Body: body}
+	}
+	if result != nil {
+		err = json.NewDecoder(res.Body).Decode(result)
+		if err != nil {
+			return HttpReqError{StatusCode: res.StatusCode, Url: url, JSONError: err}
+		}
+	}
+	return nil
+}
+
+func (c *BeaconchainApiClient) ConsolidationRequests(ctx context.Context, network string, slot uint64) (*BeaconchainConsolidationRequestsResponse, error) {
+	res := &BeaconchainConsolidationRequestsResponse{}
+	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.beaconcha.in/api/v1/slot/%d/consolidation_requests", network, slot), nil, nil, res)
+	return res, err
+}
+
+func (c *BeaconchainApiClient) DepositRequests(ctx context.Context, network string, slot uint64) (*BeaconchainDepositRequestsResponse, error) {
+	res := &BeaconchainDepositRequestsResponse{}
+	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.beaconcha.in/api/v1/slot/%d/deposit_requests", network, slot), nil, nil, res)
+	return res, err
+}
+
+type BeaconchainDepositRequestsResponse struct {
+	Status string                      `json:"status"`
+	Data   []BeaconchainDepositRequest `json:"data"`
+}
+
+type BeaconchainDepositRequest struct {
+	Amount                int64  `json:"amount"`
+	BlockRoot             string `json:"block_root"`
+	BlockSlot             uint64 `json:"block_slot"`
+	Pubkey                string `json:"pubkey"`
+	RequestIndex          uint64 `json:"request_index"`
+	Signature             string `json:"signature"`
+	WithdrawalCredentials string `json:"withdrawal_credentials"`
+}
+
+type BeaconchainConsolidationRequestsResponse struct {
+	Status string                            `json:"status"`
+	Data   []BeaconchainConsolidationRequest `json:"data"`
+}
+
+type BeaconchainConsolidationRequest struct {
+	AmountConsolidated int64  `json:"amount_consolidated"`
+	BlockRoot          string `json:"block_root"`
+	BlockSlot          uint64 `json:"block_slot"`
+	RequestIndex       uint64 `json:"request_index"`
+	SourceIndex        uint64 `json:"source_index"`
+	TargetIndex        uint64 `json:"target_index"`
+}
+
+type HttpReqError struct {
+	StatusCode int
+	Url        string
+	Body       []byte
+	JSONError  error
+	HTTPError  error
+}
+
+func (e HttpReqError) Error() string {
+	var bs string
+	if len(e.Body) > 1024 {
+		bs = string(e.Body[:1024]) + "…"
+	} else {
+		bs = string(e.Body)
+	}
+	return fmt.Sprintf("error: statusCode: %v, url: %v, jsonError: %v, httpErro: %v, body: %v", e.StatusCode, e.Url, e.JSONError, e.HTTPError, bs)
+}
+
+type Ratelimiter struct {
+	reqChan     chan int
+	ticker      *time.Ticker
+	reqPerSec   float64
+	reqPerSecMu sync.RWMutex
+}
+
+func NewRatelimiter(reqPerSec float64) *Ratelimiter {
+	rl := &Ratelimiter{}
+	rl.reqPerSecMu = sync.RWMutex{}
+	rl.reqChan = make(chan int, 1)
+	rl.ticker = time.NewTicker(1e9 * time.Second / time.Duration(1e9*reqPerSec))
+	rl.SetRate(reqPerSec)
+	go func() {
+		for range rl.ticker.C {
+			select {
+			case <-rl.reqChan:
+			default:
+			}
+		}
+	}()
+	return rl
+}
+
+func (rl *Ratelimiter) Wait() {
+	rl.reqChan <- 1
+}
+
+func (rl *Ratelimiter) GetRate() float64 {
+	rl.reqPerSecMu.RLock()
+	defer rl.reqPerSecMu.RUnlock()
+	return rl.reqPerSec
+}
+
+func (rl *Ratelimiter) SetRate(reqPerSec float64) {
+	rl.reqPerSecMu.Lock()
+	defer rl.reqPerSecMu.Unlock()
+	if reqPerSec < 0 {
+		return
+	}
+	if rl.reqPerSec == reqPerSec {
+		return
+	}
+	rl.reqPerSec = reqPerSec
+	rl.ticker.Reset(1e9 * time.Second / time.Duration(1e9*rl.reqPerSec))
 }
