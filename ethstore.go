@@ -40,7 +40,7 @@ const RECEIPTS_MODE_BATCH = 0
 const RECEIPTS_MODE_SINGLE = 1
 
 var debugLevel = uint64(0)
-var beaconchainApiClient = NewBeaconchainApiClient("")
+var beaconchainApiClient = NewBeaconchainApiClient()
 var execTimeout = time.Second * 120
 var execTimeoutMu = sync.Mutex{}
 var consTimeout = time.Second * 120
@@ -791,33 +791,37 @@ type TxReceipt struct {
 }
 
 type BeaconchainApiClient struct {
-	headers     atomic.Value
+	apikey      string
+	apikeyMu    sync.Mutex
 	ratelimiter *Ratelimiter
 }
 
-func NewBeaconchainApiClient(apiKey string) *BeaconchainApiClient {
+func NewBeaconchainApiClient() *BeaconchainApiClient {
 	c := &BeaconchainApiClient{
-		headers:     atomic.Value{},
+		apikey:      "",
 		ratelimiter: NewRatelimiter(1),
 	}
-	c.headers.Store(map[string]string{"apikey": apiKey})
 	return c
 }
 
 func (c *BeaconchainApiClient) SetApiKey(apiKey string) {
-	c.headers.Store(map[string]string{"apikey": apiKey})
+	c.apikeyMu.Lock()
+	defer c.apikeyMu.Unlock()
+	c.apikey = apiKey
+}
+
+func (c *BeaconchainApiClient) GetApiKey() string {
+	c.apikeyMu.Lock()
+	defer c.apikeyMu.Unlock()
+	return c.apikey
 }
 
 func (c *BeaconchainApiClient) HttpReq(ctx context.Context, method, url string, headers map[string]string, params, result interface{}) error {
 	c.ratelimiter.Wait()
-	cHeaders := c.headers.Load().(map[string]string)
 	if headers == nil {
-		headers = cHeaders
-	} else {
-		for k, v := range cHeaders {
-			headers[k] = v
-		}
+		headers = make(map[string]string)
 	}
+	headers["apikey"] = c.GetApiKey()
 
 	var err error
 	var req *http.Request
