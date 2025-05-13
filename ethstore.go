@@ -301,6 +301,8 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		beaconchainApiNetworkName = "gnosis"
 	case "0x10000910":
 		beaconchainApiNetworkName = "hoodi"
+	default:
+		return nil, nil, fmt.Errorf("unsupported GENESIS_FORK_VERSION: %s (only mainnet, gnosis, hoodi)", fmt.Sprintf("%#x", genesisForkVersion))
 	}
 
 	electraForkEpoch := uint64(math.MaxUint64)
