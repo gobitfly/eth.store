@@ -795,15 +795,30 @@ type TxReceipt struct {
 type BeaconchainApiClient struct {
 	apikey      string
 	apikeyMu    sync.Mutex
+	domain      string
+	domainMu    sync.Mutex
 	ratelimiter *Ratelimiter
 }
 
 func NewBeaconchainApiClient() *BeaconchainApiClient {
 	c := &BeaconchainApiClient{
 		apikey:      "",
+		domain:      "beaconcha.in",
 		ratelimiter: NewRatelimiter(1),
 	}
 	return c
+}
+
+func (c *BeaconchainApiClient) SetDomain(domain string) {
+	c.domainMu.Lock()
+	defer c.domainMu.Unlock()
+	c.domain = domain
+}
+
+func (c *BeaconchainApiClient) GetDomain() string {
+	c.domainMu.Lock()
+	defer c.domainMu.Unlock()
+	return c.domain
 }
 
 func (c *BeaconchainApiClient) SetApiKey(apiKey string) {
@@ -886,13 +901,13 @@ func (c *BeaconchainApiClient) HttpReq(ctx context.Context, method, url string, 
 
 func (c *BeaconchainApiClient) ConsolidationRequests(ctx context.Context, network string, slot uint64) (*BeaconchainConsolidationRequestsResponse, error) {
 	res := &BeaconchainConsolidationRequestsResponse{}
-	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.beaconcha.in/api/v1/slot/%d/consolidation_requests", network, slot), nil, nil, res)
+	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.%s/api/v1/slot/%d/consolidation_requests", network, c.GetDomain(), slot), nil, nil, res)
 	return res, err
 }
 
 func (c *BeaconchainApiClient) DepositRequests(ctx context.Context, network string, slot uint64) (*BeaconchainDepositRequestsResponse, error) {
 	res := &BeaconchainDepositRequestsResponse{}
-	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.beaconcha.in/api/v1/slot/%d/deposit_requests", network, slot), nil, nil, res)
+	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.%s/api/v1/slot/%d/deposit_requests", network, c.GetDomain(), slot), nil, nil, res)
 	return res, err
 }
 
