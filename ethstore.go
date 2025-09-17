@@ -83,6 +83,14 @@ func GetDebugLevel() uint64 {
 	return atomic.LoadUint64(&debugLevel)
 }
 
+func SetDomain(domain string) {
+	beaconchainApiClient.SetDomain(domain)
+}
+
+func GetDomain() string {
+	return beaconchainApiClient.GetDomain()
+}
+
 func SetConsTimeout(dur time.Duration) {
 	consTimeoutMu.Lock()
 	defer consTimeoutMu.Unlock()
