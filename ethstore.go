@@ -269,6 +269,15 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.Withdrawals = block.Electra.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Electra.Message.Body.ExecutionPayload.BlockNumber
 		d.Transactions = block.Electra.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionFulu:
+		d.Deposits = block.Fulu.Message.Body.Deposits
+		d.ProposerIndex = block.Fulu.Message.ProposerIndex
+		d.GasUsed = block.Fulu.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Fulu.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Fulu.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
+		d.Withdrawals = block.Fulu.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Fulu.Message.Body.ExecutionPayload.BlockNumber
+		d.Transactions = block.Fulu.Message.Body.ExecutionPayload.Transactions
 	default:
 		return nil, fmt.Errorf("unknown block version: %v", block.Version)
 	}

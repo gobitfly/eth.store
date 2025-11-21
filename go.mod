@@ -3,7 +3,7 @@ module github.com/gobitfly/eth.store
 go 1.23.1
 
 require (
-	github.com/attestantio/go-eth2-client v0.24.0
+	github.com/attestantio/go-eth2-client v0.27.1
 	github.com/ethereum/go-ethereum v1.14.6-0.20250124151602-75526bb8e01b
 	github.com/hashicorp/golang-lru v0.5.5-0.20210104140557-80c98217689d
 	github.com/prysmaticlabs/prysm/v5 v5.1.2
@@ -58,7 +58,7 @@ require (
 	github.com/r3labs/sse/v2 v2.10.0 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/supranational/blst v0.3.13 // indirect
+	github.com/supranational/blst v0.3.14 // indirect
 	github.com/thomaso-mirodin/intmath v0.0.0-20160323211736-5dc6d854e46e // indirect
 	github.com/tklauser/go-sysconf v0.3.13 // indirect
 	github.com/tklauser/numcpus v0.7.0 // indirect
