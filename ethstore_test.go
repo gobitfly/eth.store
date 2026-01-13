@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -49,35 +50,41 @@ func TestEthstore(t *testing.T) {
 		"/eth/v2/beacon/blocks/0":          `{"version":"phase0","data":{"message":{"slot":"0","proposer_index":"0","parent_root":"0x0000000000000000000000000000000000000000000000000000000000000000","state_root":"0x7e76880eb67bbdc86250aa578958e9d0675e64e714337855204fb5abaaf82c2b","body":{"randao_reveal":"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","eth1_data":{"deposit_root":"0x0000000000000000000000000000000000000000000000000000000000000000","deposit_count":"0","block_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"},"graffiti":"0x0000000000000000000000000000000000000000000000000000000000000000","proposer_slashings":[],"attester_slashings":[],"attestations":[],"deposits":[],"voluntary_exits":[]}},"signature":"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}`,
 	}
 
+	type MockDebugValidator struct {
+		Pubkey                     string `json:"pubkey"`
+		WithdrawalCredentials      string `json:"withdrawal_credentials"`
+		EffectiveBalance           string `json:"effective_balance"`
+		Slashed                    bool   `json:"slashed"`
+		ActivationEligibilityEpoch string `json:"activation_eligibility_epoch"`
+		ActivationEpoch            string `json:"activation_epoch"`
+		ExitEpoch                  string `json:"exit_epoch"`
+		WithdrawableEpoch          string `json:"withdrawable_epoch"`
+	}
+
 	type MockValidator struct {
-		Index     string `json:"index"`
-		Balance   string `json:"balance"`
-		Status    string `json:"status"`
-		Validator struct {
-			Pubkey                     string `json:"pubkey"`
-			WithdrawalCredentials      string `json:"withdrawal_credentials"`
-			EffectiveBalance           string `json:"effective_balance"`
-			Slashed                    bool   `json:"slashed"`
-			ActivationEligibilityEpoch string `json:"activation_eligibility_epoch"`
-			ActivationEpoch            string `json:"activation_epoch"`
-			ExitEpoch                  string `json:"exit_epoch"`
-			WithdrawableEpoch          string `json:"withdrawable_epoch"`
-		} `json:"validator"`
+		Index     string              `json:"index"`
+		Balance   string              `json:"balance"`
+		Status    string              `json:"status"`
+		Validator *MockDebugValidator `json:"validator"`
 	}
 
 	type MockValidatorsResponse struct {
-		Data []MockValidator `json:"data"`
+		Data []*MockValidator `json:"data"`
 	}
 
 	txFeeGweiPerBlock := uint64(10000)
 	numValis := 33
 
-	mockStartValidators := MockValidatorsResponse{make([]MockValidator, numValis)}
+	mockStartValidators := MockValidatorsResponse{make([]*MockValidator, numValis)}
+	mockStartDebugValidators := make([]*MockDebugValidator, numValis)
+	mockStartBalances := make([]string, numValis)
+
 	for i := 0; i < numValis; i++ {
-		v := MockValidator{}
+		v := &MockValidator{}
 		v.Index = fmt.Sprintf("%d", i)
 		v.Balance = "32000000000"
 		v.Status = "active_ongoing"
+		v.Validator = &MockDebugValidator{}
 		v.Validator.Pubkey = fmt.Sprintf("%#096x", i)
 		v.Validator.WithdrawalCredentials = fmt.Sprintf("%#064x", i)
 		v.Validator.EffectiveBalance = "32000000000"
@@ -87,14 +94,20 @@ func TestEthstore(t *testing.T) {
 		v.Validator.ExitEpoch = "18446744073709551615"
 		v.Validator.WithdrawableEpoch = "18446744073709551615"
 		mockStartValidators.Data[i] = v
+		mockStartDebugValidators[i] = v.Validator
+		mockStartBalances[i] = v.Balance
 	}
 
-	mockEndValidators := MockValidatorsResponse{make([]MockValidator, numValis)}
+	mockEndValidators := MockValidatorsResponse{make([]*MockValidator, numValis)}
+	mockEndDebugValidators := make([]*MockDebugValidator, numValis)
+	mockEndBalances := make([]string, numValis)
+
 	for i := 0; i < numValis; i++ {
-		v := MockValidator{}
+		v := &MockValidator{}
 		v.Index = fmt.Sprintf("%d", i)
 		v.Balance = "32003200000"
 		v.Status = "active_ongoing"
+		v.Validator = &MockDebugValidator{}
 		v.Validator.Pubkey = fmt.Sprintf("%#096x", i)
 		v.Validator.WithdrawalCredentials = fmt.Sprintf("%#064x", i)
 		v.Validator.EffectiveBalance = "32000000000"
@@ -104,6 +117,8 @@ func TestEthstore(t *testing.T) {
 		v.Validator.ExitEpoch = "18446744073709551615"
 		v.Validator.WithdrawableEpoch = "18446744073709551615"
 		mockEndValidators.Data[i] = v
+		mockEndDebugValidators[i] = v.Validator
+		mockEndBalances[i] = v.Balance
 	}
 
 	// validator 0 exited on the last epoch of day 9
@@ -112,6 +127,7 @@ func TestEthstore(t *testing.T) {
 	mockEndValidators.Data[0].Validator.ExitEpoch = fmt.Sprintf("%d", 10*225-1)
 	mockEndValidators.Data[0].Status = "exited_unslashed"
 	mockEndValidators.Data[0].Balance = "32000000000"
+	mockStartBalances[0] = "32000000000"
 
 	// validator 1 exited on the last epoch of day 10
 	mockEndValidators.Data[1].Validator.ExitEpoch = fmt.Sprintf("%d", 11*225-1)
@@ -131,6 +147,7 @@ func TestEthstore(t *testing.T) {
 	mockStartValidators.Data[4].Validator.Pubkey = "0xb07210c8839f03532d8b7e27a1b0ec9503454fa29a2cbe563896636757214247699420553ce51f78fa9d72d79d0a2fc1"
 	mockEndValidators.Data[4].Validator.Pubkey = "0xb07210c8839f03532d8b7e27a1b0ec9503454fa29a2cbe563896636757214247699420553ce51f78fa9d72d79d0a2fc1"
 	mockEndValidators.Data[4].Balance = "64003200000"
+	mockEndBalances[4] = "64003200000"
 
 	mockStartValidatorsJson, err := json.Marshal(&mockStartValidators)
 	if err != nil {
@@ -144,6 +161,29 @@ func TestEthstore(t *testing.T) {
 
 	mocks["/eth/v1/beacon/states/72000/validators"] = string(mockStartValidatorsJson)
 	mocks["/eth/v1/beacon/states/79200/validators"] = string(mockEndValidatorsJson)
+
+	mockStartValidatorsDataJson, err := json.Marshal(&mockStartDebugValidators)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mockEndValidatorsDataJson, err := json.Marshal(&mockEndDebugValidators)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mockStartBalancesJson, err := json.Marshal(&mockStartBalances)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mockEndBalancesJson, err := json.Marshal(&mockEndBalances)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mocks["/eth/v2/debug/beacon/states/72000"] = fmt.Sprintf(`{ "version": "phase0", "execution_optimistic": false, "finalized": false, "data": { "genesis_time": "1", "genesis_validators_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "slot": "72000", "fork": { "previous_version": "0x00000000", "current_version": "0x00000000", "epoch": "1" }, "latest_block_header": { "slot": "1", "proposer_index": "1", "parent_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "state_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "body_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "block_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "state_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "historical_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "eth1_data": { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "eth1_data_votes": [ { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } ], "eth1_deposit_index": "1", "validators": %s, "balances":%s, "slashings": [ ], "previous_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "current_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "justification_bits": "0x01", "previous_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "current_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "finalized_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } } }`, mockStartValidatorsDataJson, mockStartBalancesJson)
+	mocks["/eth/v2/debug/beacon/states/79200"] = fmt.Sprintf(`{ "version": "phase0", "execution_optimistic": false, "finalized": false, "data": { "genesis_time": "1", "genesis_validators_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "slot": "79200", "fork": { "previous_version": "0x00000000", "current_version": "0x00000000", "epoch": "1" }, "latest_block_header": { "slot": "1", "proposer_index": "1", "parent_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "state_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "body_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "block_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "state_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "historical_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "eth1_data": { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "eth1_data_votes": [ { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } ], "eth1_deposit_index": "1", "validators": %s, "balances":%s, "slashings": [ ], "previous_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "current_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "justification_bits": "0x01", "previous_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "current_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "finalized_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } } }`, mockEndValidatorsDataJson, mockEndBalancesJson)
 
 	validator4DidExtraDeposit := false
 	for i := 10 * 225 * 32; i < 11*225*32; i++ {
@@ -208,20 +248,36 @@ func TestEthstore(t *testing.T) {
 	)
 	defer bnServer.Close()
 
+	type elServerReq struct {
+		Jsonrpc string   `json:"jsonrpc"`
+		ID      int      `json:"id"`
+		Method  string   `json:"method"`
+		Params  []string `json:"params"`
+	}
+
 	elServer := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs := []*elServerReq{}
+			err = json.NewDecoder(r.Body).Decode(&reqs)
+			if err != nil {
+				t.Fatal(err)
+			}
 			effectiveGasPrice := hexutil.EncodeUint64(100)
 			gasUsed := hexutil.EncodeUint64(1e11 + 23080)
-			d := []byte(fmt.Sprintf(`[{ "jsonrpc": "2.0", "result": { "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "blockNumber": "0x712208", "contractAddress": null, "cumulativeGasUsed": "0x1a8c4", "effectiveGasPrice": "%s", "from": "0x9709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "gasUsed": "%s", "logs": [ { "address": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "topics": [ "0x9dbb0e7dda3e09710ce75b801addc87cf9d9c6c581641b3275fca409ad086c62", "0x0000000000000000000000009709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "0x06c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c753" ], "data": "0x00000000000000000000000000000000000000000000000002c68af0bb140000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x0", "removed": false }, { "address": "0xde29d060d45901fb19ed6c6e959eb22d8626708e", "topics": [ "0x7d3450d4f5138e54dcb21a322312d50846ead7856426fb38778f8ef33aeccc01", "0x000000000000000000000000c3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "0x073314940630fd6dcda0d772d4c972c4e0a9946bef9dabf4ef84eda8ef542b82", "0x02d757788a8d8d6f21d1cd40bce38a8222d70654214e96ff95d8086e684fbee5" ], "data": "0x0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000002c0bb000000000000000000000000000000000000000000000000000000000000000306c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c75300000000000000000000000000000000000000000000000002c68af0bb1400000000000000000000000000000000000000000000000000000000000000000000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x1", "removed": false } ], "logsBloom": "0x00000000000000000000000000000000002000000000000000000000000080040000002000000000001000001004000000000000001008100000000000000000000000000000000000000200000000000000000000002000000000040000000000000000020000000000000000000000000000000000000000000000000000000000000000800000000000000000000000001000022000000000000008000000000000000000000000000000000000000000000000200000000000000000000000000000008020000000000004000000000000000080000000000420000000000000000000000080000000000000000000000000000000000000000000000000", "status": "0x1", "to": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "type": "0x2" }, "id": 0 }]`, effectiveGasPrice, gasUsed))
+			res := []string{}
+			for _, req := range reqs {
+				res = append(res, fmt.Sprintf(`{ "jsonrpc": "2.0", "id": %v, "result": { "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "blockNumber": "0x712208", "contractAddress": null, "cumulativeGasUsed": "0x1a8c4", "effectiveGasPrice": "%s", "from": "0x9709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "gasUsed": "%s", "logs": [ { "address": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "topics": [ "0x9dbb0e7dda3e09710ce75b801addc87cf9d9c6c581641b3275fca409ad086c62", "0x0000000000000000000000009709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "0x06c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c753" ], "data": "0x00000000000000000000000000000000000000000000000002c68af0bb140000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x0", "removed": false }, { "address": "0xde29d060d45901fb19ed6c6e959eb22d8626708e", "topics": [ "0x7d3450d4f5138e54dcb21a322312d50846ead7856426fb38778f8ef33aeccc01", "0x000000000000000000000000c3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "0x073314940630fd6dcda0d772d4c972c4e0a9946bef9dabf4ef84eda8ef542b82", "0x02d757788a8d8d6f21d1cd40bce38a8222d70654214e96ff95d8086e684fbee5" ], "data": "0x0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000002c0bb000000000000000000000000000000000000000000000000000000000000000306c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c75300000000000000000000000000000000000000000000000002c68af0bb1400000000000000000000000000000000000000000000000000000000000000000000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x1", "removed": false } ], "logsBloom": "0x00000000000000000000000000000000002000000000000000000000000080040000002000000000001000001004000000000000001008100000000000000000000000000000000000000200000000000000000000002000000000040000000000000000020000000000000000000000000000000000000000000000000000000000000000800000000000000000000000001000022000000000000008000000000000000000000000000000000000000000000000200000000000000000000000000000008020000000000004000000000000000080000000000420000000000000000000000080000000000000000000000000000000000000000000000000", "status": "0x1", "to": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "type": "0x2" } }`, req.ID, effectiveGasPrice, gasUsed))
+			}
+			d := []byte("[" + strings.Join(res, ",") + "]")
 			w.Write(d)
 		}),
 	)
 	defer elServer.Close()
 
 	// SetDebugLevel(1)
-	day, _, err := Calculate(context.Background(), bnServer.URL, elServer.URL, "10", 1)
+	day, _, err := Calculate(context.Background(), bnServer.URL, elServer.URL, "10", 1, RECEIPTS_MODE_BATCH)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	t.Logf("%+v", *day)

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"sort"
@@ -20,16 +19,18 @@ import (
 )
 
 var opts struct {
-	Days        string
-	Validators  string
-	ConsAddress string
-	ConsTimeout time.Duration
-	ExecAddress string
-	ExecTimeout time.Duration
-	Json        bool
-	JsonFile    string
-	DebugLevel  uint64
-	Version     bool
+	Days              string
+	Validators        string
+	ConsAddress       string
+	ConsTimeout       time.Duration
+	ExecAddress       string
+	ExecTimeout       time.Duration
+	Json              bool
+	JsonFile          string
+	DebugLevel        uint64
+	Version           bool
+	ReceiptsMode      int
+	BeaconchainApikey string
 }
 
 func main() {
@@ -42,6 +43,8 @@ func main() {
 	flag.StringVar(&opts.JsonFile, "json.file", "", "path to file to write results into, only missing days will be added")
 	flag.Uint64Var(&opts.DebugLevel, "debug", 0, "set debug-level (higher level will increase verbosity)")
 	flag.BoolVar(&opts.Version, "version", false, "print version and exit")
+	flag.IntVar(&opts.ReceiptsMode, "receipts-mode", 0, "mode to use for fetching tx receipts, 0 = eth_getTransactionReceipt, 1 = eth_getBlockReceipts")
+	flag.StringVar(&opts.BeaconchainApikey, "beaconchain.apikey", "", "beaconchain apikey to use")
 	flag.Parse()
 
 	if opts.Version {
@@ -49,9 +52,14 @@ func main() {
 		return
 	}
 
+	if opts.ReceiptsMode != 0 && opts.ReceiptsMode != 1 {
+		log.Fatalf("invalid receipts mode provided, can only be 0 or 1")
+	}
+
 	ethstore.SetConsTimeout(opts.ConsTimeout)
 	ethstore.SetExecTimeout(opts.ExecTimeout)
 	ethstore.SetDebugLevel(opts.DebugLevel)
+	ethstore.SetBeaconchainApiKey(opts.BeaconchainApikey)
 
 	days := []uint64{}
 
@@ -69,13 +77,13 @@ func main() {
 		if daysSplit[1] == "finalized" {
 			d, err := ethstore.GetFinalizedDay(context.Background(), opts.ConsAddress)
 			if err != nil {
-				log.Fatalf("error getting lattest day: %v", err)
+				log.Fatalf("error getting finalized day: %v", err)
 			}
 			toDay = d
 		} else if daysSplit[1] == "head" {
 			d, err := ethstore.GetHeadDay(context.Background(), opts.ConsAddress)
 			if err != nil {
-				log.Fatalf("error getting lattest day: %v", err)
+				log.Fatalf("error getting head day: %v", err)
 			}
 			toDay = d
 		} else {
@@ -124,7 +132,7 @@ func main() {
 		fileDays := []*ethstore.Day{}
 		_, err := os.Stat(opts.JsonFile)
 		if err == nil {
-			fileDaysBytes, err := ioutil.ReadFile(opts.JsonFile)
+			fileDaysBytes, err := os.ReadFile(opts.JsonFile)
 			if err != nil {
 				log.Fatalf("error reading file: %v", err)
 			}
@@ -145,7 +153,7 @@ func main() {
 				logEthstoreDay(d)
 				continue
 			}
-			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10)
+			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10, opts.ReceiptsMode)
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
@@ -157,7 +165,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("error marshaling ethstore: %v", err)
 			}
-			err = ioutil.WriteFile(opts.JsonFile, fileDaysJson, 0644)
+			err = os.WriteFile(opts.JsonFile, fileDaysJson, 0644)
 			if err != nil {
 				log.Fatalf("error writing ethstore to file: %v", err)
 			}
@@ -168,7 +176,7 @@ func main() {
 	} else {
 		result := []*ethstore.Day{}
 		for _, dd := range days {
-			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10)
+			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10, opts.ReceiptsMode)
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
@@ -188,5 +196,5 @@ func main() {
 }
 
 func logEthstoreDay(d *ethstore.Day) {
-	fmt.Printf("day: %v (%v), epochs: %v-%v, validators: %v, apr: %v, effectiveBalanceSumGwei: %v, totalRewardsSumWei: %v, consensusRewardsGwei: %v (%s%%), txFeesSumWei: %v\n", d.Day, d.DayTime, d.StartEpoch, d.StartEpoch.Add(decimal.New(224, 0)), d.Validators, d.Apr.StringFixed(9), d.EffectiveBalanceGwei, d.TotalRewardsWei, d.ConsensusRewardsGwei, d.ConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9*1e2)).Div(d.TotalRewardsWei).StringFixed(2), d.TxFeesSumWei)
+	fmt.Printf("day: %v (%v), epochs: %v-%v, validators: %v, apr: %v, effectiveBalanceSumGwei: %v, totalRewardsSumWei: %v, consensusRewardsGwei: %v (%s%%), txFeesSumWei: %v\n", d.Day, d.DayTime, d.StartEpoch, d.StartEpoch.Add(decimal.New(224, 0)), d.Validators, d.Apr.StringFixed(9), d.EffectiveBalanceGwei, d.TotalRewardsWei, d.ConsensusRewardsGwei, d.ConsensusRewardsGwei.Abs().Mul(decimal.NewFromInt(1e9*1e2)).Div(d.TotalRewardsWei.Abs()).StringFixed(2), d.TxFeesSumWei)
 }
