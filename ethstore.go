@@ -455,6 +455,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			delete(validatorsByPubkey, val.Validator.PublicKey.String())
 			continue
 		}
+		if v.EffectiveBalanceGwei != val.Validator.EffectiveBalance {
+			// effective balance changed during the day, do not account this validator
+			delete(validatorsByIndex, val.Index)
+			delete(validatorsByPubkey, val.Validator.PublicKey.String())
+			continue
+		}
 		// set endBalance of validator to the balance of the first epoch of the next day
 		v.EndBalanceGwei = val.Balance
 	}
@@ -473,13 +479,14 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			beaconchainApiGroup := new(errgroup.Group)
 			beaconchainApiGroup.SetLimit(10)
 
-			for i := firstEpoch; i <= lastEpoch; i++ {
+			for i := firstEpoch + 1; i <= lastEpoch+1; i++ {
 				i := i
 				if i == 0 {
 					continue
 				}
 				beaconchainApiGroup.Go(func() error {
 					var err error
+					log.Printf("DEBUG eth.store: fetching deposit and consolidation requests for epoch %v (slot %v)\n", i, i*slotsPerEpoch-1)
 					depositRequests, err := beaconchainApiClient.DepositRequests(ctx, beaconchainApiNetworkName, i*slotsPerEpoch-1)
 					if err != nil {
 						return fmt.Errorf("error getting depositRequests for epoch %v (slot %v): %w", i, i*slotsPerEpoch-1, err)
