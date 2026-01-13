@@ -455,6 +455,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			delete(validatorsByPubkey, val.Validator.PublicKey.String())
 			continue
 		}
+		if v.EffectiveBalanceGwei != val.Validator.EffectiveBalance {
+			// effective balance changed during the day, do not account this validator
+			delete(validatorsByIndex, val.Index)
+			delete(validatorsByPubkey, val.Validator.PublicKey.String())
+			continue
+		}
 		// set endBalance of validator to the balance of the first epoch of the next day
 		v.EndBalanceGwei = val.Balance
 	}

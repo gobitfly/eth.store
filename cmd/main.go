@@ -153,7 +153,7 @@ func main() {
 				logEthstoreDay(d)
 				continue
 			}
-			d, _, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10, opts.ReceiptsMode)
+			d, valis, err := ethstore.Calculate(context.Background(), opts.ConsAddress, opts.ExecAddress, fmt.Sprintf("%d", dd), 10, opts.ReceiptsMode)
 			if err != nil {
 				log.Fatalf("error calculating ethstore: %v", err)
 			}
@@ -171,6 +171,30 @@ func main() {
 			}
 			if !opts.Json {
 				logEthstoreDay(d)
+			}
+			type Vali struct {
+				Day            ethstore.Day
+				ValidatorIndex uint64 `json:"validatorIndex"`
+			}
+			valiArr := []Vali{}
+			for valiIndex, vali := range valis {
+				valiArr = append(valiArr, Vali{
+					Day:            *vali,
+					ValidatorIndex: valiIndex,
+				})
+			}
+			sort.SliceStable(valiArr, func(i, j int) bool {
+				return valiArr[i].Day.ConsensusRewardsGwei.Cmp(valiArr[j].Day.ConsensusRewardsGwei) < 0
+			})
+			fmt.Printf("Top 10 validators for day %d by consensus rewards:\n", dd)
+			for i := len(valiArr) - 1; i >= len(valiArr)-10 && i >= 0; i-- {
+				v := valiArr[i]
+				fmt.Printf("  Validator %d: %+v\n", v.ValidatorIndex, v.Day)
+			}
+			fmt.Printf("Bottom 10 validators for day %d by consensus rewards:\n", dd)
+			for i := 0; i < 10 && i < len(valiArr); i++ {
+				v := valiArr[i]
+				fmt.Printf("  Validator %d: %+v\n", v.ValidatorIndex, v.Day)
 			}
 		}
 	} else {
