@@ -107,6 +107,17 @@ func SetBeaconchainApiKey(apiKey string) {
 	beaconchainApiClient.SetApiKey(apiKey)
 }
 
+// SetRatelimitTargetFraction sets the share of the beaconchain API's
+// advertised per-second ratelimit the client paces itself to. Lower it when
+// multiple processes share one API key. Values outside (0, 1] are ignored.
+func SetRatelimitTargetFraction(fraction float64) {
+	beaconchainApiClient.SetRatelimitTargetFraction(fraction)
+}
+
+func GetRatelimitTargetFraction() float64 {
+	return beaconchainApiClient.GetRatelimitTargetFraction()
+}
+
 func GetConsTimeout() time.Duration {
 	consTimeoutMu.Lock()
 	defer consTimeoutMu.Unlock()
@@ -816,18 +827,21 @@ type TxReceipt struct {
 }
 
 type BeaconchainApiClient struct {
-	apikey      string
-	apikeyMu    sync.Mutex
-	domain      string
-	domainMu    sync.Mutex
-	ratelimiter *Ratelimiter
+	apikey              string
+	apikeyMu            sync.Mutex
+	domain              string
+	domainMu            sync.Mutex
+	ratelimiter         *Ratelimiter
+	ratelimitFraction   float64
+	ratelimitFractionMu sync.Mutex
 }
 
 func NewBeaconchainApiClient() *BeaconchainApiClient {
 	c := &BeaconchainApiClient{
-		apikey:      "",
-		domain:      "beaconcha.in",
-		ratelimiter: NewRatelimiter(1),
+		apikey:            "",
+		domain:            "beaconcha.in",
+		ratelimiter:       NewRatelimiter(1),
+		ratelimitFraction: defaultRatelimitTargetFraction,
 	}
 	return c
 }
@@ -856,7 +870,90 @@ func (c *BeaconchainApiClient) GetApiKey() string {
 	return c.apikey
 }
 
+// SetRatelimitTargetFraction sets the share of the API's advertised per-second
+// limit this client paces itself to. Lower it when multiple processes share
+// one API key. Values outside (0, 1] are ignored.
+func (c *BeaconchainApiClient) SetRatelimitTargetFraction(fraction float64) {
+	if fraction <= 0 || fraction > 1 {
+		return
+	}
+	c.ratelimitFractionMu.Lock()
+	defer c.ratelimitFractionMu.Unlock()
+	c.ratelimitFraction = fraction
+}
+
+func (c *BeaconchainApiClient) GetRatelimitTargetFraction() float64 {
+	c.ratelimitFractionMu.Lock()
+	defer c.ratelimitFractionMu.Unlock()
+	return c.ratelimitFraction
+}
+
+// defaultRatelimitTargetFraction is the share of the API's advertised
+// per-second limit this client paces itself to. The limit applies per API key
+// and every process sharing a key draws on one budget, so lower it via
+// SetRatelimitTargetFraction when several processes share a key.
+const defaultRatelimitTargetFraction = .9
+
+// httpReqMaxAttempts bounds the 429 retries in HttpReq, so a genuinely
+// exhausted or misconfigured limit still fails instead of retrying forever.
+const httpReqMaxAttempts = 5
+
+// httpReqFallbackRetryDelay is used when a 429 carries no usable
+// ratelimit-reset header.
+const httpReqFallbackRetryDelay = time.Second
+
+// httpReqMaxRetryDelay bounds how long a single retry may wait. A 429 can
+// carry a ratelimit-reset for a larger window (hour, month), where waiting it
+// out would hang the caller for hours; failing fast keeps the error visible.
+const httpReqMaxRetryDelay = 10 * time.Second
+
+// HttpReq performs the request, retrying while the API answers 429.
+//
+// A single 429 used to fail the caller outright, which discarded a whole
+// eth.store day: the deposit and consolidation requests for one day are ~450
+// calls, and losing any one of them re-runs all of them. Retrying is safe here
+// because every caller is an idempotent GET.
+//
+// Each attempt re-enters httpReq and so passes through c.ratelimiter.Wait(),
+// which paces retries with all other in-flight requests instead of letting the
+// concurrent callers stampede on recovery.
 func (c *BeaconchainApiClient) HttpReq(ctx context.Context, method, url string, headers map[string]string, params, result interface{}) error {
+	var err error
+	for attempt := 0; attempt < httpReqMaxAttempts; attempt++ {
+		err = c.httpReq(ctx, method, url, headers, params, result)
+
+		var reqErr HttpReqError
+		if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusTooManyRequests {
+			return err
+		}
+		if attempt == httpReqMaxAttempts-1 {
+			return err
+		}
+
+		delay := reqErr.RetryAfter
+		if delay <= 0 {
+			delay = httpReqFallbackRetryDelay
+		} else if delay > httpReqMaxRetryDelay {
+			// The offending window rolls over too far in the future for a
+			// retry to help; fail fast instead of sleeping it out.
+			return err
+		}
+		if GetDebugLevel() > 0 {
+			log.Printf("DEBUG eth.store: ratelimited, retrying in %v (attempt %d/%d): %v\n", delay, attempt+1, httpReqMaxAttempts, url)
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func (c *BeaconchainApiClient) httpReq(ctx context.Context, method, url string, headers map[string]string, params, result interface{}) error {
 	c.ratelimiter.Wait()
 	if headers == nil {
 		headers = make(map[string]string)
@@ -887,14 +984,15 @@ func (c *BeaconchainApiClient) HttpReq(ctx context.Context, method, url string, 
 	httpClient := &http.Client{Timeout: time.Minute}
 	res, err := httpClient.Do(req)
 	if err != nil {
-		return HttpReqError{StatusCode: res.StatusCode, Url: url, HTTPError: err}
+		// res is nil whenever Do reports an error, so it must not be dereferenced.
+		return HttpReqError{Url: url, HTTPError: err}
 	}
 
 	rlStr := res.Header.Get("ratelimit-limit")
 	if rlStr != "" {
 		rl, err := strconv.ParseInt(rlStr, 10, 64)
 		if err == nil && rl > 2 {
-			rlFloat := float64(rl) * .9 // avoid hitting the ratelimit
+			rlFloat := float64(rl) * c.GetRatelimitTargetFraction()
 			if rlFloat != c.ratelimiter.GetRate() {
 				c.ratelimiter.SetRate(rlFloat)
 				if GetDebugLevel() > 0 {
@@ -904,14 +1002,19 @@ func (c *BeaconchainApiClient) HttpReq(ctx context.Context, method, url string, 
 		}
 	}
 
-	if res.StatusCode == 429 {
+	var retryAfter time.Duration
+	if res.StatusCode == http.StatusTooManyRequests {
+		// ratelimit-reset is the seconds until the offending window rolls over.
+		if secs, convErr := strconv.ParseInt(res.Header.Get("ratelimit-reset"), 10, 64); convErr == nil && secs > 0 {
+			retryAfter = time.Duration(secs) * time.Second
+		}
 		log.Printf("DEBUG eth.store: status: 429, limit: %v, remaining: %v, reset: %v, window: %v, remaining-day: %v, remaining-hour: %v, remaining-minute: %v, remaining-month: %v, remaining-second: %v\n", res.Header.Get("ratelimit-limit"), res.Header.Get("ratelimit-remaining"), res.Header.Get("ratelimit-reset"), res.Header.Get("ratelimit-window"), res.Header.Get("x-ratelimit-remaining-day"), res.Header.Get("x-ratelimit-remaining-hour"), res.Header.Get("x-ratelimit-remaining-minute"), res.Header.Get("x-ratelimit-remaining-month"), res.Header.Get("x-ratelimit-remaining-second"))
 	}
 
 	defer res.Body.Close()
 	if res.StatusCode > 299 {
 		body, _ := io.ReadAll(res.Body)
-		return HttpReqError{StatusCode: res.StatusCode, Url: url, Body: body}
+		return HttpReqError{StatusCode: res.StatusCode, Url: url, Body: body, RetryAfter: retryAfter}
 	}
 	if result != nil {
 		err = json.NewDecoder(res.Body).Decode(result)
@@ -969,6 +1072,9 @@ type HttpReqError struct {
 	Body       []byte
 	JSONError  error
 	HTTPError  error
+	// RetryAfter is how long the API asked the caller to wait, taken from the
+	// ratelimit-reset header of a 429. Zero when the response carried none.
+	RetryAfter time.Duration
 }
 
 func (e HttpReqError) Error() string {
