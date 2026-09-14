@@ -29,13 +29,17 @@ func TestEthstore(t *testing.T) {
 	// validator 2 activated on the second epoch of day 10
 	// validator 3 activated on the last epoch of day 10 and deposited 32 Eth extra during day 10
 	// validator 4 deposited 100 Eth extra during day 10
-	// therefore only 29 validators (indices 4 to 32) should be considered when calculating the eth.store, which is: 365 * (sumOfEndBalances - sumOfStartBalances - sumOfExtraDeposits + sumOfTxFees) / sumOfEffbalancesAtStart
-	// given our scenario this should result in 365 * (28*32.0032e18+1*32.0032e18+32e18 - 29*32e18 - 1*32e18 + 10000e9*32*225*29/32) / (32e18*29) = 0.0621640625
+	// validator 5 has a withdrawal in the block at firstSlot, which is the last block of day 9
+	// validator 6 starts with an extra 1000 Eth and withdraws it in the block at endSlot, which is the last block of day 10
+	// therefore only 29 validators (indices 4 to 32) should be considered when calculating the eth.store, which is: 365 * (sumOfEndBalances - sumOfStartBalances - sumOfExtraDeposits + sumOfWithdrawals + sumOfTxFees) / sumOfEffbalancesAtStart
+	// given our scenario this should result in 365 * (28*32.0032e18+1*32.0032e18+32e18 - 29*32e18 - 1000e18 - 1*32e18 + 1000e18 + 10000e9*32*225*29/32) / (32e18*29) = 0.0621640625
 	// explaining the numbers:
 	// - 365 is the number of days in a year (we ignore leap-years for apr-calculation of eth.store)
 	// - 28*32.0032e18+1*32.0032e18+32e18 = sumOfEndBalances = 28 validators each with a balance of 32.0032 eth at the end of the day and one validator deposited extra 100 eth - which is added to the endBalance of the validator
 	// - 29*32e18 = sumOfStartBalances = 29 validators each with 32 eth start balance
 	// - 1*32e18 = sumOfExtraDeposits = 1 validator deposited 100 eth extra in the set of validators that is considered for the calculation, note that the other deposit should not be considered
+	// - 1000e18 = the extra 1000 eth validator 6 holds at the start of the day and withdraws again before the end of the day
+	// - 1000e18 = sumOfWithdrawals = only validator 6's withdrawal counts, validator 5's withdrawal is in the block at firstSlot and is therefore already part of its startBalance
 	// - 10000e9*32*225*29/32 = sumOfTxFees = 10000 Gwei tx-fee for txs in 32*225 blocks (32 blocks in 225 epochs), but only 29 of the 32 validators who actually propose blocks are in the eth.store validator-set
 	// - 32e18*29 = sumOfEffectiveBalances = 29 validators have each an effective balance of 32 eth at the start of the eth.store-day
 	// - 0.0621640625 = eth.store-apr = according to the eth.store-calculation validators will earn 6.22% interest in a year
@@ -150,6 +154,10 @@ func TestEthstore(t *testing.T) {
 	mockEndValidators.Data[4].Balance = "64003200000"
 	mockEndBalances[4] = "64003200000"
 
+	// validator 6 holds an extra 1000 Eth at the start of day 10 and withdraws it in the block at endSlot
+	mockStartValidators.Data[6].Balance = "1032000000000"
+	mockStartBalances[6] = "1032000000000"
+
 	mockStartValidatorsJson, err := json.Marshal(&mockStartValidators)
 	if err != nil {
 		t.Error(err)
@@ -187,9 +195,21 @@ func TestEthstore(t *testing.T) {
 	mocks["/eth/v2/debug/beacon/states/79200"] = fmt.Sprintf(`{ "version": "phase0", "execution_optimistic": false, "finalized": false, "data": { "genesis_time": "1", "genesis_validators_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "slot": "79200", "fork": { "previous_version": "0x00000000", "current_version": "0x00000000", "epoch": "1" }, "latest_block_header": { "slot": "1", "proposer_index": "1", "parent_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "state_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "body_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "block_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "state_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "historical_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "eth1_data": { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "eth1_data_votes": [ { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } ], "eth1_deposit_index": "1", "validators": %s, "balances":%s, "slashings": [ ], "previous_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "current_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "justification_bits": "0x01", "previous_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "current_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "finalized_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } } }`, mockEndValidatorsDataJson, mockEndBalancesJson)
 
 	validator4DidExtraDeposit := false
-	for i := 10 * 225 * 32; i < 11*225*32; i++ {
+	// note that the blocks at firstSlot and at endSlot are both mocked: firstSlot belongs to
+	// day 9 and endSlot belongs to day 10, so exactly one of the two withdrawals below may
+	// end up in the result
+	for i := 10 * 225 * 32; i <= 11*225*32; i++ {
 		proposer := i%(numValis-1) + 1 // validator with index 0 does not propose blocks on this day
 		deposits := "[]"
+		withdrawals := "[]"
+		switch i {
+		case 10 * 225 * 32:
+			// validator 5 withdrew 0.016 Eth in the block at firstSlot, which is already part of its startBalance and must not be counted
+			withdrawals = `[{"index":"1","validator_index":"5","address":"0x0000000000000000000000000000000000000005","amount":"16000000"}]`
+		case 11 * 225 * 32:
+			// validator 6 withdrew 1000 Eth in the block at endSlot, which is part of its endBalance and must be counted
+			withdrawals = `[{"index":"2","validator_index":"6","address":"0x0000000000000000000000000000000000000006","amount":"1000000000000"}]`
+		}
 		if proposer == 4 && !validator4DidExtraDeposit {
 			// validator 4 deposited 100 Eth extra during day 10
 			validator4DidExtraDeposit = true
@@ -235,7 +255,7 @@ func TestEthstore(t *testing.T) {
 				"signature": "0xa70b7440dd48d5b0d11e530c63ba307dfa07a011b695e8f0621555e6af85e365da6f7de39f61ad5f13ee9f8b9d5c10990d52cb993eb5ad2e7f0cf7f96a33bc596444972ca5d99e134bbb166fc720a8ca04f3ee9027756f91afacf8d6603cd392"
 			} }]`
 		}
-		mocks[fmt.Sprintf("/eth/v2/beacon/blocks/%d", i)] = fmt.Sprintf(`{"version":"bellatrix","data":{"message":{"slot":"%d","proposer_index":"%d","parent_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","state_root":"0x3c900df8e277bade69a1c29a93f9442940fc5e43a96c60dfc33d0f0a54a73af6","body":{"randao_reveal":"0x886b31ed2d6caead1e6632dcaec7edb113789f81dbc101160f903ad72c01429203c15ae75e00bd6987ca5ec79750f9c6040a7805284b24f5b3fa8131579c743e592033de069345ccb4b9a99fd73712d8b2276791847282dbfb7634fcb050ae80","eth1_data":{"deposit_root":"0x9df92d765b5aa041fd4bbe8d5878eb89290efa78e444c1a603eecfae2ea05fa4","deposit_count":"403","block_hash":"0x4d0d1732d9a72d2127ab2ad120e66da738cab3369239ec9debd7aea3b89f9812"},"graffiti":"0x0000000000000000000000000000000000000000000000000000000000000000","proposer_slashings":[],"attester_slashings":[],"attestations":[{"aggregation_bits":"0xf7fa6fffbcbbbf6f","data":{"slot":"357843","index":"0","beacon_block_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","source":{"epoch":"11181","root":"0xa0d0f93cc58e7e0a6b08c600d2a8054dc41fbadd8aba116e6e8cb1a1870321d0"},"target":{"epoch":"11182","root":"0x82cf146d63ea46194fb6ea4e2c99b244aea76cf8c6546ae09a749a0406d78823"}},"signature":"0xad7d675b775c89fb5c1605f1c91bb595e4feb0a2a0440b23aacfbc6d95daa02e761e8ad48a6cf0dd041d65250a97bf1200e879212f389173cdb2c5792d977411aa44f62eb79e71447f00f2eb02c3aacb4fdc4e939a5d7d01a2198ccdb758b641"}],"deposits":%s,"voluntary_exits":[],"sync_aggregate":{"sync_committee_bits":"0xf74edf53ffdb7f7f7db76efef7fcfb6eff7ffeffbff7f7fddf3f57f7d7fff1b7b7fb3e7bffffff5afe7fffff7fcb437fdffee3efd6dff76df766ffffd7fffff1","sync_committee_signature":"0x98fef94f6488bcb1d1c47517e28683d280c36cfd3caa37403e40a72b0500de7ce84f234760edc17a2bd1031db194570d17af1eb253d4d117f88b39e30ee0ab7c00db268db8369188600a9665708ddd34701840ca1bc1b3c646641b60eda2019d"},"execution_payload":{"parent_hash":"0xca7e7e7fcf3ef35a569c1647d56b11873664e3972d17c5dc339af901230166d5","fee_recipient":"0x8b0c2c4c8eb078bc6c01f48523764c8942c0c6c4","state_root":"0x65ff6f9be55e066f1ed9f5f899752e174c31793034260389316c0ae897483512","receipts_root":"0x1544df33845496bdab8cb97867ec0c6e060ed6690e54c85ae4cb9cc58ddc00dd","logs_bloom":"0x08000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000200000000000000000000000000004000000000000001002000000000000001000000000000000000000000000000020000000100000000000800000000000000000000000000000000080000000000000000000000000000000000000480000000008000000000000000000000001040000000000000000000000000000000000000000000000000000000000000000000000400000000000000004000000001000000000000000020000000000000000000000000000000000000000000000000000000000000000010","prev_randao":"0x3c3397f7c670538c30a11f6c5733e66af09f9a34ab0ef31b0ffa63314b79099f","block_number":"1663387","gas_limit":"30000000","gas_used":"230800","timestamp":"1660027728","extra_data":"0x","base_fee_per_gas":"10","block_hash":"0x8145108c4ba0bd6507019ee9ef1eaa225daa0fd220bfea44f5e1d3b58c313875","transactions":["%#x"]}}},"signature":"0x8b0c109f0148cd7979bc8101f35e909c8b24e08fbfb0a36491270f2d3889c08b71ab83f59f005eff75272627e569f2d91769524dd5790f918955315534e245ad65423fe45f6fb749d9d4cc593c6f56388eef6c5b123b0f7cb526cbdf7fa053c8"}}`, i, proposer, deposits, createTx(txFeeGweiPerBlock))
+		mocks[fmt.Sprintf("/eth/v2/beacon/blocks/%d", i)] = fmt.Sprintf(`{"version":"capella","data":{"message":{"slot":"%d","proposer_index":"%d","parent_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","state_root":"0x3c900df8e277bade69a1c29a93f9442940fc5e43a96c60dfc33d0f0a54a73af6","body":{"randao_reveal":"0x886b31ed2d6caead1e6632dcaec7edb113789f81dbc101160f903ad72c01429203c15ae75e00bd6987ca5ec79750f9c6040a7805284b24f5b3fa8131579c743e592033de069345ccb4b9a99fd73712d8b2276791847282dbfb7634fcb050ae80","eth1_data":{"deposit_root":"0x9df92d765b5aa041fd4bbe8d5878eb89290efa78e444c1a603eecfae2ea05fa4","deposit_count":"403","block_hash":"0x4d0d1732d9a72d2127ab2ad120e66da738cab3369239ec9debd7aea3b89f9812"},"graffiti":"0x0000000000000000000000000000000000000000000000000000000000000000","proposer_slashings":[],"attester_slashings":[],"attestations":[{"aggregation_bits":"0xf7fa6fffbcbbbf6f","data":{"slot":"357843","index":"0","beacon_block_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","source":{"epoch":"11181","root":"0xa0d0f93cc58e7e0a6b08c600d2a8054dc41fbadd8aba116e6e8cb1a1870321d0"},"target":{"epoch":"11182","root":"0x82cf146d63ea46194fb6ea4e2c99b244aea76cf8c6546ae09a749a0406d78823"}},"signature":"0xad7d675b775c89fb5c1605f1c91bb595e4feb0a2a0440b23aacfbc6d95daa02e761e8ad48a6cf0dd041d65250a97bf1200e879212f389173cdb2c5792d977411aa44f62eb79e71447f00f2eb02c3aacb4fdc4e939a5d7d01a2198ccdb758b641"}],"deposits":%s,"voluntary_exits":[],"sync_aggregate":{"sync_committee_bits":"0xf74edf53ffdb7f7f7db76efef7fcfb6eff7ffeffbff7f7fddf3f57f7d7fff1b7b7fb3e7bffffff5afe7fffff7fcb437fdffee3efd6dff76df766ffffd7fffff1","sync_committee_signature":"0x98fef94f6488bcb1d1c47517e28683d280c36cfd3caa37403e40a72b0500de7ce84f234760edc17a2bd1031db194570d17af1eb253d4d117f88b39e30ee0ab7c00db268db8369188600a9665708ddd34701840ca1bc1b3c646641b60eda2019d"},"execution_payload":{"parent_hash":"0xca7e7e7fcf3ef35a569c1647d56b11873664e3972d17c5dc339af901230166d5","fee_recipient":"0x8b0c2c4c8eb078bc6c01f48523764c8942c0c6c4","state_root":"0x65ff6f9be55e066f1ed9f5f899752e174c31793034260389316c0ae897483512","receipts_root":"0x1544df33845496bdab8cb97867ec0c6e060ed6690e54c85ae4cb9cc58ddc00dd","logs_bloom":"0x08000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000200000000000000000000000000004000000000000001002000000000000001000000000000000000000000000000020000000100000000000800000000000000000000000000000000080000000000000000000000000000000000000480000000008000000000000000000000001040000000000000000000000000000000000000000000000000000000000000000000000400000000000000004000000001000000000000000020000000000000000000000000000000000000000000000000000000000000000010","prev_randao":"0x3c3397f7c670538c30a11f6c5733e66af09f9a34ab0ef31b0ffa63314b79099f","block_number":"1663387","gas_limit":"30000000","gas_used":"230800","timestamp":"1660027728","extra_data":"0x","base_fee_per_gas":"10","block_hash":"0x8145108c4ba0bd6507019ee9ef1eaa225daa0fd220bfea44f5e1d3b58c313875","transactions":["%#x"],"withdrawals":%s},"bls_to_execution_changes":[]}},"signature":"0x8b0c109f0148cd7979bc8101f35e909c8b24e08fbfb0a36491270f2d3889c08b71ab83f59f005eff75272627e569f2d91769524dd5790f918955315534e245ad65423fe45f6fb749d9d4cc593c6f56388eef6c5b123b0f7cb526cbdf7fa053c8"}}`, i, proposer, deposits, createTx(txFeeGweiPerBlock), withdrawals)
 	}
 
 	bnServer := httptest.NewServer(
@@ -284,9 +304,11 @@ func TestEthstore(t *testing.T) {
 	t.Logf("%+v", *day)
 
 	extraDepositsWei := decimal.NewFromInt(32e9).Mul(decimal.NewFromInt(1e9))
+	// only validator 6's withdrawal, in the block at endSlot, belongs to day 10
+	withdrawalsWei := decimal.NewFromInt(1000e9).Mul(decimal.NewFromInt(1e9))
 	endWei := decimal.NewFromInt(29 * 320032e5).Mul(decimal.NewFromInt(1e9)).Add(extraDepositsWei)
-	startWei := decimal.NewFromInt(29 * 32e9).Mul(decimal.NewFromInt(1e9))
-	consWei := endWei.Sub(startWei).Sub(extraDepositsWei)
+	startWei := decimal.NewFromInt(29 * 32e9).Mul(decimal.NewFromInt(1e9)).Add(withdrawalsWei)
+	consWei := endWei.Sub(startWei).Sub(extraDepositsWei).Add(withdrawalsWei)
 	execWei := decimal.NewFromInt(29 * 10000 * 225).Mul(decimal.NewFromInt(1e9))
 	eff := decimal.NewFromInt(29 * 32e9).Mul(decimal.NewFromInt(1e9))
 	apr := decimal.NewFromInt(365).Mul(consWei.Add(execWei)).Div(eff)
@@ -311,6 +333,9 @@ func TestEthstore(t *testing.T) {
 	}
 	if !day.DepositsSumGwei.Equal(extraDepositsWei.Div(decimal.NewFromInt(1e9))) {
 		t.Errorf("wrong DepositsSumGwei: %v != %v", day.DepositsSumGwei, extraDepositsWei.Div(decimal.NewFromInt(1e9)))
+	}
+	if !day.WithdrawalsSumGwei.Equal(withdrawalsWei.Div(decimal.NewFromInt(1e9))) {
+		t.Errorf("wrong WithdrawalsSumGwei: %v != %v", day.WithdrawalsSumGwei, withdrawalsWei.Div(decimal.NewFromInt(1e9)))
 	}
 	if !day.ConsensusRewardsGwei.Equal(consWei.Div(decimal.NewFromInt(1e9))) {
 		t.Errorf("wrong ConsensusRewardsGwei: %v != %v", day.ConsensusRewardsGwei, 92800000)
