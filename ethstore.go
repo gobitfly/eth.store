@@ -404,10 +404,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	}
 
 	firstSlot := day * slotsPerDay
-	// endSlot is the first slot of the next eth.store-day. The day's balances are read
-	// from the states at firstSlot and at endSlot, so the blocks that belong to this day
-	// are the ones in (firstSlot,endSlot] - see the block loop below.
-	endSlot := (day + 1) * slotsPerDay
+	endSlot := (day + 1) * slotsPerDay // first slot not included in this eth.store-day
 
 	if endSlot > finalizedSlot {
 		endSlot = finalizedSlot
@@ -556,19 +553,24 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		})
 	}
 
-	// Get all deposits, withdrawals and txs of all active validators in the slot interval
-	// (firstSlot,endSlot].
+	// Get all deposits, withdrawals and txs of all active validators of this day. The two
+	// groups deliberately use different slot intervals:
 	//
-	// The interval is left-open and right-closed because it has to line up with the two
-	// states the balances are read from: block firstSlot has already been applied to the
-	// start balance, and block endSlot has already been applied to the end balance.
-	// Scanning [firstSlot,endSlot) instead counts the withdrawals of block firstSlot a
-	// second time and misses those of block endSlot, so a withdrawal in block endSlot is
-	// subtracted from the end balance without ever being added back and shows up as a
-	// penalty of its own size. On mainnet day 2110 (2026-09-11) a single 995.8 ETH
-	// EIP-7002 withdrawal request was processed in block endSlot and pushed the reported
-	// apr from 2.65% down to 1.78%.
-	for i := firstSlot + 1; i <= endSlot; i++ {
+	//   - Tx fees are not part of the balance delta, so they use the published window of
+	//     epochs [SE,EE), which is the blocks in [firstSlot,endSlot).
+	//
+	//   - Deposits and withdrawals adjust that balance delta, so they have to match the
+	//     two states it is read from. Those are post-block states, so block firstSlot is
+	//     already in the start balance and block endSlot is already in the end balance:
+	//     the blocks in (firstSlot,endSlot].
+	//
+	// Using [firstSlot,endSlot) for the second group counts the withdrawals of block
+	// firstSlot a second time and misses those of block endSlot. A missed withdrawal is
+	// subtracted from the end balance without ever being added back, so it surfaces as a
+	// penalty of its own size: on mainnet day 2110 (2026-09-11) a 995.8 ETH EIP-7002
+	// withdrawal request was processed in block endSlot and pushed the reported apr from
+	// 2.65% down to 1.78%.
+	for i := firstSlot; i <= endSlot; i++ {
 		i := i
 		if GetDebugLevel() > 0 && (endSlot-i)%1000 == 0 {
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
@@ -611,7 +613,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 			v, exists := validatorsByIndex[blockData.ProposerIndex]
 			// only calculate for validators that have been active the whole day
-			if exists && len(blockData.Transactions) > 0 {
+			if i < endSlot && exists && len(blockData.Transactions) > 0 {
 				txHashes := []common.Hash{}
 				for _, tx := range blockData.Transactions {
 					var decTx gethTypes.Transaction
@@ -672,6 +674,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 				if GetDebugLevel() > 1 {
 					log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v, burnt: %v\n", i, blockData.BlockNumber, baseFeePerGas, totalTxFee, burntFee)
 				}
+			}
+
+			if i == firstSlot {
+				// block firstSlot is already part of the start balance
+				return nil
 			}
 
 			validatorsMu.Lock()
