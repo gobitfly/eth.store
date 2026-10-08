@@ -387,6 +387,16 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		}
 	}
 
+	gloasForkEpoch := uint64(math.MaxUint64)
+	gloasForkEpochStr, exists := apiSpec.Data["GLOAS_FORK_EPOCH"]
+	if exists {
+		var ok bool
+		gloasForkEpoch, ok = gloasForkEpochStr.(uint64)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid format of GLOAS_FORK_EPOCH in spec")
+		}
+	}
+
 	domainDepositIf, exists := apiSpec.Data["DOMAIN_DEPOSIT"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined DOMAIN_DEPOSIT in spec")
@@ -458,6 +468,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	firstEpoch := firstSlot / slotsPerEpoch
 	lastEpoch := lastSlot / slotsPerEpoch
 	endEpoch := lastEpoch + 1
+
+	// the gloas payload at endSlot is only decided by a later block
+	if gloasForkEpoch <= endEpoch && finalizedSlot <= endSlot {
+		return nil, nil, fmt.Errorf("%w: day %v ends at the finalized slot %v", ErrPayloadsNotFinalized, day, finalizedSlot)
+	}
 
 	genesis, err := client.GenesisTime(ctx)
 	if err != nil {
