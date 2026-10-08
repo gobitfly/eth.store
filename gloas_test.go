@@ -234,9 +234,11 @@ func TestEthstoreGloas(t *testing.T) {
 				ws = []elWithdrawal{}
 			}
 			wsJson, _ := json.Marshal(ws)
-			return fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"hash":"%#x","number":"%s","baseFeePerGas":"0x7","gasUsed":"0x5208","transactions":["%#x"],"withdrawals":%s}}`, req.ID, testHash(slot), hexutil.EncodeUint64(slot), testHash(slot+1e9), wsJson)
+			return fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"hash":"%#x","number":"%s","baseFeePerGas":"0x7","gasUsed":"0x4e20","transactions":["%#x"],"withdrawals":%s}}`, req.ID, testHash(slot), hexutil.EncodeUint64(slot), testHash(slot+1e9), wsJson)
 		case "eth_getTransactionReceipt":
-			// gasUsed 21000 at effectiveGasPrice 10 with a base fee of 7 leaves a priority fee of 21000*3
+			// gasUsed 21000 at effectiveGasPrice 10 with a base fee of 7 leaves a priority fee of 21000*3.
+			// The header reports 20000 gas: Amsterdam headers report less gas than their receipts sum
+			// to, so the burn must not be taken from the header.
 			return fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"effectiveGasPrice":"0xa","gasUsed":"0x5208","cumulativeGasUsed":"0x5208","logsBloom":"0x","status":"0x1","transactionIndex":"0x0","type":"0x2"}}`, req.ID)
 		}
 		t.Errorf("unexpected el method %v", req.Method)

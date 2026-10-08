@@ -104,7 +104,6 @@ type elBlock struct {
 	Hash          common.Hash     `json:"hash"`
 	Number        hexutil.Uint64  `json:"number"`
 	BaseFeePerGas *hexutil.Big    `json:"baseFeePerGas"`
-	GasUsed       hexutil.Uint64  `json:"gasUsed"`
 	Transactions  []common.Hash   `json:"transactions"`
 	Withdrawals   []*elWithdrawal `json:"withdrawals"`
 }
@@ -266,7 +265,7 @@ func accountGloasPayloads(ctx context.Context, client *ethHttp.Service, elClient
 			}
 			var txFees *big.Int
 			if t.fees && len(blk.Transactions) > 0 {
-				txFees, err = txFeesWei(elClient, receiptsMode, t.block.Slot, blk.Transactions, uint64(blk.Number), blk.BaseFeePerGas.ToInt(), uint64(blk.GasUsed))
+				txFees, err = priorityFeesWei(elClient, receiptsMode, t.block.Slot, blk.Transactions, uint64(blk.Number), blk.BaseFeePerGas.ToInt())
 				if err != nil {
 					return err
 				}

@@ -820,6 +820,45 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 // txFeesWei returns the priority fees paid in a block: the fees of its
 // receipts minus the burnt base fee.
 func txFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64, baseFeePerGas *big.Int, gasUsed uint64) (*big.Int, error) {
+	txReceipts, err := requestReceiptsWithRetry(elClient, receiptsMode, slot, txHashes, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	totalTxFee := big.NewInt(0)
+	for _, r := range txReceipts {
+		if r.EffectiveGasPrice == nil {
+			return nil, fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", slot, *r)
+		}
+		txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
+		totalTxFee.Add(totalTxFee, txFee)
+	}
+
+	burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(gasUsed))
+	return totalTxFee.Sub(totalTxFee, burntFee), nil
+}
+
+// priorityFeesWei returns the priority fees paid in a block as the sum of each
+// receipt's tip. Unlike txFeesWei it does not take the burn from the header's
+// gasUsed, which on Amsterdam blocks is lower than the gas the receipts charged.
+func priorityFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64, baseFeePerGas *big.Int) (*big.Int, error) {
+	txReceipts, err := requestReceiptsWithRetry(elClient, receiptsMode, slot, txHashes, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	total := big.NewInt(0)
+	for _, r := range txReceipts {
+		if r.EffectiveGasPrice == nil {
+			return nil, fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", slot, *r)
+		}
+		tip := new(big.Int).Sub(r.EffectiveGasPrice.ToInt(), baseFeePerGas)
+		total.Add(total, tip.Mul(tip, new(big.Int).SetUint64(uint64(r.GasUsed))))
+	}
+	return total, nil
+}
+
+func requestReceiptsWithRetry(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64) ([]*TxReceipt, error) {
 	var txReceipts []*TxReceipt
 	var err error
 	for j := 0; j < 10; j++ { // retry up to 10 times
@@ -849,18 +888,7 @@ func txFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes
 	if err != nil {
 		return nil, fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", slot, err)
 	}
-
-	totalTxFee := big.NewInt(0)
-	for _, r := range txReceipts {
-		if r.EffectiveGasPrice == nil {
-			return nil, fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", slot, *r)
-		}
-		txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
-		totalTxFee.Add(totalTxFee, txFee)
-	}
-
-	burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(gasUsed))
-	return totalTxFee.Sub(totalTxFee, burntFee), nil
+	return txReceipts, nil
 }
 
 func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashes []common.Hash) ([]*TxReceipt, error) {
