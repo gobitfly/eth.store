@@ -838,7 +838,8 @@ func txFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes
 
 // priorityFeesWei returns the priority fees paid in a block as the sum of each
 // receipt's tip. Unlike txFeesWei it does not take the burn from the header's
-// gasUsed, which on Amsterdam blocks is lower than the gas the receipts charged.
+// gasUsed, which from Amsterdam on differs from the gas the receipts charged.
+// Before Amsterdam both give the same result, and pre-fork blocks keep txFeesWei.
 func priorityFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64, baseFeePerGas *big.Int) (*big.Int, error) {
 	txReceipts, err := requestReceiptsWithRetry(elClient, receiptsMode, slot, txHashes, blockNumber)
 	if err != nil {
