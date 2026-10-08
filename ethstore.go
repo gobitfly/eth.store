@@ -244,11 +244,9 @@ type BlockData struct {
 	ExecutionBlockHash phase0.Hash32
 	// From Gloas on, the payload is not in the block body: Transactions,
 	// BaseFeePerGas, GasUsed, GasLimit, Withdrawals and BlockNumber stay unset,
-	// and the payload has to be read from the execution layer. These come from
-	// the bid.
+	// and the payload has to be read from the execution layer.
+	// ParentExecutionBlockHash comes from the bid and is only set from Gloas on.
 	ParentExecutionBlockHash phase0.Hash32
-	BuilderIndex             uint64
-	BidValueGwei             phase0.Gwei
 }
 
 func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
@@ -333,8 +331,6 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.ParentRoot = block.Gloas.Message.ParentRoot
 		d.ExecutionBlockHash = bid.BlockHash
 		d.ParentExecutionBlockHash = bid.ParentBlockHash
-		d.BuilderIndex = uint64(bid.BuilderIndex)
-		d.BidValueGwei = bid.Value
 	default:
 		return nil, fmt.Errorf("unknown block version: %v", block.Version)
 	}
