@@ -31,6 +31,7 @@ var opts struct {
 	Version           bool
 	ReceiptsMode      int
 	BeaconchainApikey string
+	BeaconchainUrl    string
 }
 
 func main() {
@@ -45,6 +46,7 @@ func main() {
 	flag.BoolVar(&opts.Version, "version", false, "print version and exit")
 	flag.IntVar(&opts.ReceiptsMode, "receipts-mode", 0, "mode to use for fetching tx receipts, 0 = eth_getTransactionReceipt, 1 = eth_getBlockReceipts")
 	flag.StringVar(&opts.BeaconchainApikey, "beaconchain.apikey", "", "beaconchain apikey to use")
+	flag.StringVar(&opts.BeaconchainUrl, "beaconchain.url", "", "base url of the beaconchain api, overrides https://<network>.beaconcha.in and allows chains other than mainnet, gnosis and hoodi (e.g. devnets)")
 	flag.Parse()
 
 	if opts.Version {
@@ -60,6 +62,7 @@ func main() {
 	ethstore.SetExecTimeout(opts.ExecTimeout)
 	ethstore.SetDebugLevel(opts.DebugLevel)
 	ethstore.SetBeaconchainApiKey(opts.BeaconchainApikey)
+	ethstore.SetBeaconchainApiBaseUrl(opts.BeaconchainUrl)
 
 	days := []uint64{}
 

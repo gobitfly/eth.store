@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,6 +106,18 @@ func SetExecTimeout(dur time.Duration) {
 
 func SetBeaconchainApiKey(apiKey string) {
 	beaconchainApiClient.SetApiKey(apiKey)
+}
+
+// SetBeaconchainApiBaseUrl points the beaconchain API at a fixed base URL (for
+// example "http://localhost:8080") instead of https://<network>.<domain>. With
+// a base URL set, chains other than mainnet, gnosis and hoodi are accepted,
+// which is what devnets need.
+func SetBeaconchainApiBaseUrl(baseUrl string) {
+	beaconchainApiClient.SetBaseUrl(baseUrl)
+}
+
+func GetBeaconchainApiBaseUrl() string {
+	return beaconchainApiClient.GetBaseUrl()
 }
 
 // SetRatelimitTargetFraction sets the share of the beaconchain API's
@@ -330,7 +343,9 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	case "0x10000910":
 		beaconchainApiNetworkName = "hoodi"
 	default:
-		return nil, nil, fmt.Errorf("unsupported GENESIS_FORK_VERSION: %s (only mainnet, gnosis, hoodi)", fmt.Sprintf("%#x", genesisForkVersion))
+		if GetBeaconchainApiBaseUrl() == "" {
+			return nil, nil, fmt.Errorf("unsupported GENESIS_FORK_VERSION: %s (only mainnet, gnosis, hoodi, or set a beaconchain API base URL)", fmt.Sprintf("%#x", genesisForkVersion))
+		}
 	}
 
 	electraForkEpoch := uint64(math.MaxUint64)
@@ -852,6 +867,8 @@ type BeaconchainApiClient struct {
 	apikeyMu            sync.Mutex
 	domain              string
 	domainMu            sync.Mutex
+	baseUrl             string
+	baseUrlMu           sync.Mutex
 	ratelimiter         *Ratelimiter
 	ratelimitFraction   float64
 	ratelimitFractionMu sync.Mutex
@@ -877,6 +894,25 @@ func (c *BeaconchainApiClient) GetDomain() string {
 	c.domainMu.Lock()
 	defer c.domainMu.Unlock()
 	return c.domain
+}
+
+func (c *BeaconchainApiClient) SetBaseUrl(baseUrl string) {
+	c.baseUrlMu.Lock()
+	defer c.baseUrlMu.Unlock()
+	c.baseUrl = strings.TrimRight(baseUrl, "/")
+}
+
+func (c *BeaconchainApiClient) GetBaseUrl() string {
+	c.baseUrlMu.Lock()
+	defer c.baseUrlMu.Unlock()
+	return c.baseUrl
+}
+
+func (c *BeaconchainApiClient) slotUrl(network string, slot uint64, resource string) string {
+	if baseUrl := c.GetBaseUrl(); baseUrl != "" {
+		return fmt.Sprintf("%s/api/v1/slot/%d/%s", baseUrl, slot, resource)
+	}
+	return fmt.Sprintf("https://%s.%s/api/v1/slot/%d/%s", network, c.GetDomain(), slot, resource)
 }
 
 func (c *BeaconchainApiClient) SetApiKey(apiKey string) {
@@ -1048,13 +1084,13 @@ func (c *BeaconchainApiClient) httpReq(ctx context.Context, method, url string, 
 
 func (c *BeaconchainApiClient) ConsolidationRequests(ctx context.Context, network string, slot uint64) (*BeaconchainConsolidationRequestsResponse, error) {
 	res := &BeaconchainConsolidationRequestsResponse{}
-	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.%s/api/v1/slot/%d/consolidation_requests", network, c.GetDomain(), slot), nil, nil, res)
+	err := c.HttpReq(ctx, http.MethodGet, c.slotUrl(network, slot, "consolidation_requests"), nil, nil, res)
 	return res, err
 }
 
 func (c *BeaconchainApiClient) DepositRequests(ctx context.Context, network string, slot uint64) (*BeaconchainDepositRequestsResponse, error) {
 	res := &BeaconchainDepositRequestsResponse{}
-	err := c.HttpReq(ctx, http.MethodGet, fmt.Sprintf("https://%s.%s/api/v1/slot/%d/deposit_requests", network, c.GetDomain(), slot), nil, nil, res)
+	err := c.HttpReq(ctx, http.MethodGet, c.slotUrl(network, slot, "deposit_requests"), nil, nil, res)
 	return res, err
 }
 

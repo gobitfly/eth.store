@@ -182,3 +182,14 @@ func TestHttpReqStopsRetryingWhenContextIsCancelled(t *testing.T) {
 		t.Fatalf("expected to stop after the first ratelimited attempt, got %d", got)
 	}
 }
+
+func TestSlotUrl(t *testing.T) {
+	c := NewBeaconchainApiClient()
+	if got, want := c.slotUrl("hoodi", 31, "deposit_requests"), "https://hoodi.beaconcha.in/api/v1/slot/31/deposit_requests"; got != want {
+		t.Errorf("default url: got %q, want %q", got, want)
+	}
+	c.SetBaseUrl("http://localhost:8080/")
+	if got, want := c.slotUrl("hoodi", 31, "consolidation_requests"), "http://localhost:8080/api/v1/slot/31/consolidation_requests"; got != want {
+		t.Errorf("base url: got %q, want %q", got, want)
+	}
+}
