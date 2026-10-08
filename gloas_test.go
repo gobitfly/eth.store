@@ -114,7 +114,9 @@ type gloasDayScenario struct {
 	forkSlot uint64
 	// withdrawals in the body of a fulu block
 	fuluWithdrawals map[uint64][]elWithdrawal
-	// withdrawals in the execution block of a gloas payload
+	// withdrawals in the execution block of a gloas payload. The execution layer
+	// can still serve a payload the next block skipped, so EMPTY payloads get
+	// them too, and only the bids may keep them out of the result.
 	elWithdrawals map[uint64][]elWithdrawal
 	finalizedSlot uint64
 }
@@ -215,9 +217,9 @@ func runGloasDay(t *testing.T, sc gloasDayScenario) (*Day, error) {
 		mocks[fmt.Sprintf("/eth/v2/beacon/blocks/%d", s)] = block
 		mocks[fmt.Sprintf("/eth/v2/beacon/blocks/%#x", testHash(s))] = block
 		parentSlot = s
+		known[fmt.Sprintf("%#x", testHash(s))] = s
 		if !sc.empty[s] {
 			latest = testHash(s)
-			known[fmt.Sprintf("%#x", latest)] = s
 		}
 	}
 	for e := uint64(gloasTestFirstSlot/32 + 1); e <= gloasTestEndSlot/32; e++ {
@@ -312,12 +314,16 @@ func TestEthstoreGloas(t *testing.T) {
 			// balance, although the payload of firstSlot+1 pays it inside the day. validator 2's
 			// is debited at emptySlot and paid by emptySlot+1. validator 3's is debited at endSlot
 			// and paid by endSlot+1, after the day, which needs the lookahead up to endSlot+2.
+			// Each skipped payload carries the withdrawals its block debited, as on a real chain.
 			name: "empty payloads at firstSlot, mid-day and endSlot",
 			scenario: gloasDayScenario{
 				empty: map[uint64]bool{firstSlot: true, emptySlot: true, endSlot: true},
 				elWithdrawals: map[uint64][]elWithdrawal{
+					firstSlot:     {{Index: 1, ValidatorIndex: 1, Amount: 5e9}},
 					firstSlot + 1: {{Index: 1, ValidatorIndex: 1, Amount: 5e9}},
+					emptySlot:     {{Index: 2, ValidatorIndex: 2, Amount: 7e9}},
 					emptySlot + 1: {{Index: 2, ValidatorIndex: 2, Amount: 7e9}, {Index: 3, ValidatorIndex: hexutil.Uint64(builderFlag | 5), Amount: 1e9}},
+					endSlot:       {{Index: 4, ValidatorIndex: 3, Amount: 11e9}},
 					endSlot + 1:   {{Index: 4, ValidatorIndex: 3, Amount: 11e9}},
 				},
 				finalizedSlot: finalized,
@@ -353,6 +359,16 @@ func TestEthstoreGloas(t *testing.T) {
 			},
 			wantWithdrawals:  3e9 + 2e9 + 11e9,
 			wantFullPayloads: endSlot - forkSlot,
+		},
+		{
+			// with no block at endSlot, the payload of endSlot-1 is decided by a block after
+			// the day, so the lookahead has to read past the day before its fees can count
+			name: "no block at endSlot",
+			scenario: gloasDayScenario{
+				missing:       map[uint64]bool{endSlot: true},
+				finalizedSlot: finalized,
+			},
+			wantFullPayloads: gloasTestSlotsPerDay,
 		},
 		{
 			// the day is offered as soon as endSlot is finalized, but the payload at endSlot is
