@@ -231,6 +231,7 @@ func GetValidators(ctx context.Context, client *ethHttp.Service, stateID string)
 type BlockData struct {
 	Version       spec.DataVersion
 	ProposerIndex phase0.ValidatorIndex
+	ParentRoot    phase0.Root
 	Transactions  []bellatrix.Transaction
 	BaseFeePerGas *big.Int
 	Deposits      []*phase0.Deposit
@@ -238,6 +239,14 @@ type BlockData struct {
 	GasLimit      uint64
 	Withdrawals   []*capella.Withdrawal
 	BlockNumber   uint64
+	// ExecutionBlockHash is the execution block the beacon block commits to:
+	// its payload's hash before Gloas, its bid's block hash from Gloas on.
+	ExecutionBlockHash phase0.Hash32
+	// From Gloas on, the payload is not in the block body. These come from the
+	// bid; the payload itself has to be read from the execution layer.
+	ParentExecutionBlockHash phase0.Hash32
+	BuilderIndex             uint64
+	BidValueGwei             phase0.Gwei
 }
 
 func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
@@ -261,6 +270,8 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		}
 		d.BaseFeePerGas = new(big.Int).SetBytes(baseFeePerGasBEBytes)
 		d.BlockNumber = block.Bellatrix.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Bellatrix.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Bellatrix.Message.ParentRoot
 		d.Transactions = block.Bellatrix.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionCapella:
 		d.Deposits = block.Capella.Message.Body.Deposits
@@ -274,6 +285,8 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.BaseFeePerGas = new(big.Int).SetBytes(baseFeePerGasBEBytes)
 		d.Withdrawals = block.Capella.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Capella.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Capella.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Capella.Message.ParentRoot
 		d.Transactions = block.Capella.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionDeneb:
 		d.Deposits = block.Deneb.Message.Body.Deposits
@@ -283,6 +296,8 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.BaseFeePerGas = block.Deneb.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
 		d.Withdrawals = block.Deneb.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Deneb.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Deneb.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Deneb.Message.ParentRoot
 		d.Transactions = block.Deneb.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionElectra:
 		d.Deposits = block.Electra.Message.Body.Deposits
@@ -292,6 +307,8 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.BaseFeePerGas = block.Electra.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
 		d.Withdrawals = block.Electra.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Electra.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Electra.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Electra.Message.ParentRoot
 		d.Transactions = block.Electra.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionFulu:
 		d.Deposits = block.Fulu.Message.Body.Deposits
@@ -301,7 +318,21 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.BaseFeePerGas = block.Fulu.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
 		d.Withdrawals = block.Fulu.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Fulu.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Fulu.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Fulu.Message.ParentRoot
 		d.Transactions = block.Fulu.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionGloas:
+		if block.Gloas.Message.Body.SignedExecutionPayloadBid == nil || block.Gloas.Message.Body.SignedExecutionPayloadBid.Message == nil {
+			return nil, fmt.Errorf("gloas block at slot %v has no execution payload bid", block.Gloas.Message.Slot)
+		}
+		bid := block.Gloas.Message.Body.SignedExecutionPayloadBid.Message
+		d.Deposits = block.Gloas.Message.Body.Deposits
+		d.ProposerIndex = block.Gloas.Message.ProposerIndex
+		d.ParentRoot = block.Gloas.Message.ParentRoot
+		d.ExecutionBlockHash = bid.BlockHash
+		d.ParentExecutionBlockHash = bid.ParentBlockHash
+		d.BuilderIndex = uint64(bid.BuilderIndex)
+		d.BidValueGwei = bid.Value
 	default:
 		return nil, fmt.Errorf("unknown block version: %v", block.Version)
 	}
@@ -497,6 +528,10 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	g := new(errgroup.Group)
 	g.SetLimit(concurrency)
 
+	payloadBlocks := []*payloadBlock{}
+	hasGloas := false
+	payloadBlocksMu := sync.Mutex{}
+
 	if uint64(electraForkEpoch) <= lastEpoch {
 		if GetDebugLevel() > 0 {
 			log.Printf("DEBUG eth.store: fetching deposits and consolidation requests (electraForkEpoch: %v)\n", electraForkEpoch)
@@ -626,6 +661,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 				return fmt.Errorf("error getting blockData for block at slot %v: %w", i, err)
 			}
 
+			payloadBlocksMu.Lock()
+			payloadBlocks = append(payloadBlocks, newPayloadBlock(i, blockData))
+			hasGloas = hasGloas || blockData.Version >= spec.DataVersionGloas
+			payloadBlocksMu.Unlock()
+
 			v, exists := validatorsByIndex[blockData.ProposerIndex]
 			// only calculate for validators that have been active the whole day
 			if i < endSlot && exists && len(blockData.Transactions) > 0 {
@@ -639,55 +679,17 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 					txHashes = append(txHashes, decTx.Hash())
 				}
 
-				var txReceipts []*TxReceipt
-				for j := 0; j < 10; j++ { // retry up to 10 times
-					ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
-
-					if receiptsMode == RECEIPTS_MODE_BATCH {
-						txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
-						if err == nil {
-							cancel()
-							break
-						} else {
-							log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
-							time.Sleep(time.Duration(j) * time.Second)
-						}
-					} else if receiptsMode == RECEIPTS_MODE_SINGLE {
-						txReceipts, err = requestReceipts(ctx, gethRpcClient, blockData.BlockNumber)
-						if err == nil {
-							cancel()
-							break
-						} else {
-							log.Printf("error doing requestReceipts for slot %v: %v", i, err)
-							time.Sleep(time.Duration(j) * time.Second)
-						}
-					}
-					cancel()
-				}
+				totalTxFee, err := txFeesWei(gethRpcClient, receiptsMode, i, txHashes, blockData.BlockNumber, blockData.BaseFeePerGas, blockData.GasUsed)
 				if err != nil {
-					return fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", i, err)
+					return err
 				}
-
-				totalTxFee := big.NewInt(0)
-				for _, r := range txReceipts {
-					if r.EffectiveGasPrice == nil {
-						return fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", i, *r)
-					}
-					txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
-					totalTxFee.Add(totalTxFee, txFee)
-				}
-
-				baseFeePerGas := blockData.BaseFeePerGas
-				burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(blockData.GasUsed))
-
-				totalTxFee.Sub(totalTxFee, burntFee)
 
 				validatorsMu.Lock()
 				v.TxFeesSumWei.Add(v.TxFeesSumWei, totalTxFee)
 				validatorsMu.Unlock()
 
 				if GetDebugLevel() > 1 {
-					log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v, burnt: %v\n", i, blockData.BlockNumber, baseFeePerGas, totalTxFee, burntFee)
+					log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v\n", i, blockData.BlockNumber, blockData.BaseFeePerGas, totalTxFee)
 				}
 			}
 
@@ -737,6 +739,13 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	if err := g.Wait(); err != nil {
 		return nil, nil, err
+	}
+
+	if hasGloas {
+		err = accountGloasPayloads(ctx, client, gethRpcClient, receiptsMode, concurrency, payloadBlocks, firstSlot, endSlot, finalizedSlot, validatorsByIndex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error accounting gloas payloads: %w", err)
+		}
 	}
 
 	var totalEffectiveBalanceGwei phase0.Gwei
@@ -806,6 +815,52 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	}
 
 	return ethstoreDay, ethstorePerValidator, nil
+}
+
+// txFeesWei returns the priority fees paid in a block: the fees of its
+// receipts minus the burnt base fee.
+func txFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64, baseFeePerGas *big.Int, gasUsed uint64) (*big.Int, error) {
+	var txReceipts []*TxReceipt
+	var err error
+	for j := 0; j < 10; j++ { // retry up to 10 times
+		ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
+
+		if receiptsMode == RECEIPTS_MODE_BATCH {
+			txReceipts, err = batchRequestReceipts(ctx, elClient, txHashes)
+			if err == nil {
+				cancel()
+				break
+			} else {
+				log.Printf("error doing batchRequestReceipts for slot %v: %v", slot, err)
+				time.Sleep(time.Duration(j) * time.Second)
+			}
+		} else if receiptsMode == RECEIPTS_MODE_SINGLE {
+			txReceipts, err = requestReceipts(ctx, elClient, blockNumber)
+			if err == nil {
+				cancel()
+				break
+			} else {
+				log.Printf("error doing requestReceipts for slot %v: %v", slot, err)
+				time.Sleep(time.Duration(j) * time.Second)
+			}
+		}
+		cancel()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", slot, err)
+	}
+
+	totalTxFee := big.NewInt(0)
+	for _, r := range txReceipts {
+		if r.EffectiveGasPrice == nil {
+			return nil, fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", slot, *r)
+		}
+		txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
+		totalTxFee.Add(totalTxFee, txFee)
+	}
+
+	burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(gasUsed))
+	return totalTxFee.Sub(totalTxFee, burntFee), nil
 }
 
 func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashes []common.Hash) ([]*TxReceipt, error) {
