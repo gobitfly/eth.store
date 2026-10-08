@@ -20,6 +20,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// ErrPayloadsNotFinalized means the day's gloas payloads are not all decided by
+// the finalized chain yet. It is expected right after a day's end is finalized,
+// since the payload at endSlot is only decided by a later block: retry later.
+var ErrPayloadsNotFinalized = errors.New("gloas payloads of the day are not decided by the finalized chain yet")
+
 // payloadBlock is the part of a block needed to resolve Gloas payloads, which
 // can only be done once the neighbouring blocks are known.
 type payloadBlock struct {
@@ -206,7 +211,7 @@ func accountGloasPayloads(ctx context.Context, client *ethHttp.Service, elClient
 	full, payers, pending := resolveGloasPayloads(parentBlockHash, blocks)
 	for slot := endSlot + 1; !gloasResolved(blocks, full, pending, endSlot); slot++ {
 		if slot > maxSlot {
-			return fmt.Errorf("gloas payloads of slots up to %v are not decided by the finalized chain (finalized slot: %v)", endSlot, maxSlot)
+			return fmt.Errorf("%w: slots up to %v (finalized slot: %v)", ErrPayloadsNotFinalized, endSlot, maxSlot)
 		}
 		b, err := getSlotPayloadBlock(ctx, client, slot)
 		if err != nil {

@@ -111,7 +111,7 @@ func SetBeaconchainApiKey(apiKey string) {
 // SetBeaconchainApiBaseUrl points the beaconchain API at a fixed base URL (for
 // example "http://localhost:8080") instead of https://<network>.<domain>. With
 // a base URL set, chains other than mainnet, gnosis and hoodi are accepted,
-// which is what devnets need.
+// which is what devnets need. The API key is sent to that URL as well.
 func SetBeaconchainApiBaseUrl(baseUrl string) {
 	beaconchainApiClient.SetBaseUrl(baseUrl)
 }
@@ -242,8 +242,10 @@ type BlockData struct {
 	// ExecutionBlockHash is the execution block the beacon block commits to:
 	// its payload's hash before Gloas, its bid's block hash from Gloas on.
 	ExecutionBlockHash phase0.Hash32
-	// From Gloas on, the payload is not in the block body. These come from the
-	// bid; the payload itself has to be read from the execution layer.
+	// From Gloas on, the payload is not in the block body: Transactions,
+	// BaseFeePerGas, GasUsed, GasLimit, Withdrawals and BlockNumber stay unset,
+	// and the payload has to be read from the execution layer. These come from
+	// the bid.
 	ParentExecutionBlockHash phase0.Hash32
 	BuilderIndex             uint64
 	BidValueGwei             phase0.Gwei
