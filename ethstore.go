@@ -1,17 +1,25 @@
 package ethstore
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"math/big"
+	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/api"
 	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/http"
+	ethHttp "github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
@@ -21,15 +29,19 @@ import (
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	gethRPC "github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
-	"github.com/prysmaticlabs/prysm/v3/beacon-chain/core/signing"
-	"github.com/prysmaticlabs/prysm/v3/contracts/deposit"
-	ethpb "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
+	"github.com/prysmaticlabs/prysm/v5/beacon-chain/core/signing"
+	"github.com/prysmaticlabs/prysm/v5/contracts/deposit"
+	ethpb "github.com/prysmaticlabs/prysm/v5/proto/prysm/v1alpha1"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
 )
 
+const RECEIPTS_MODE_BATCH = 0
+const RECEIPTS_MODE_SINGLE = 1
+
 var debugLevel = uint64(0)
+var beaconchainApiClient = NewBeaconchainApiClient()
 var execTimeout = time.Second * 120
 var execTimeoutMu = sync.Mutex{}
 var consTimeout = time.Second * 120
@@ -72,6 +84,14 @@ func GetDebugLevel() uint64 {
 	return atomic.LoadUint64(&debugLevel)
 }
 
+func SetDomain(domain string) {
+	beaconchainApiClient.SetDomain(domain)
+}
+
+func GetDomain() string {
+	return beaconchainApiClient.GetDomain()
+}
+
 func SetConsTimeout(dur time.Duration) {
 	consTimeoutMu.Lock()
 	defer consTimeoutMu.Unlock()
@@ -82,6 +102,33 @@ func SetExecTimeout(dur time.Duration) {
 	execTimeoutMu.Lock()
 	defer execTimeoutMu.Unlock()
 	execTimeout = dur
+}
+
+func SetBeaconchainApiKey(apiKey string) {
+	beaconchainApiClient.SetApiKey(apiKey)
+}
+
+// SetBeaconchainApiBaseUrl points the beaconchain API at a fixed base URL (for
+// example "http://localhost:8080") instead of https://<network>.<domain>. With
+// a base URL set, chains other than mainnet, gnosis and hoodi are accepted,
+// which is what devnets need. The API key is sent to that URL as well.
+func SetBeaconchainApiBaseUrl(baseUrl string) {
+	beaconchainApiClient.SetBaseUrl(baseUrl)
+}
+
+func GetBeaconchainApiBaseUrl() string {
+	return beaconchainApiClient.GetBaseUrl()
+}
+
+// SetRatelimitTargetFraction sets the share of the beaconchain API's
+// advertised per-second ratelimit the client paces itself to. Lower it when
+// multiple processes share one API key. Values outside (0, 1] are ignored.
+func SetRatelimitTargetFraction(fraction float64) {
+	beaconchainApiClient.SetRatelimitTargetFraction(fraction)
+}
+
+func GetRatelimitTargetFraction() float64 {
+	return beaconchainApiClient.GetRatelimitTargetFraction()
 }
 
 func GetConsTimeout() time.Duration {
@@ -97,16 +144,16 @@ func GetExecTimeout() time.Duration {
 }
 
 func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
-	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	service, err := ethHttp.New(ctx, ethHttp.WithAddress(address), ethHttp.WithTimeout(GetConsTimeout()), ethHttp.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return 0, err
 	}
-	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx)
+	client := service.(*ethHttp.Service)
+	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.Spec: %w", err)
 	}
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -117,26 +164,26 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	h, err := client.BeaconBlockHeader(ctx, "finalized")
+	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.BeaconBlockHeader: %w", err)
 	}
 
-	day := uint64(h.Header.Message.Slot)/slotsPerDay - 1
+	day := uint64(h.Data.Header.Message.Slot)/slotsPerDay - 1
 	return day, nil
 }
 
 func GetHeadDay(ctx context.Context, address string) (uint64, error) {
-	service, err := http.New(ctx, http.WithAddress(address), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	service, err := ethHttp.New(ctx, ethHttp.WithAddress(address), ethHttp.WithTimeout(GetConsTimeout()), ethHttp.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return 0, err
 	}
-	client := service.(*http.Service)
-	apiSpec, err := client.Spec(ctx)
+	client := service.(*ethHttp.Service)
+	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.Spec: %w", err)
 	}
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return 0, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -147,16 +194,16 @@ func GetHeadDay(ctx context.Context, address string) (uint64, error) {
 	secondsPerSlot := uint64(secondsPerSlotDur.Seconds())
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	h, err := client.BeaconBlockHeader(ctx, "finalized")
+	h, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "head"})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error calling client.BeaconBlockHeader: %w", err)
 	}
 
-	day := uint64(h.Header.Message.Slot) / slotsPerDay
+	day := uint64(h.Data.Header.Message.Slot) / slotsPerDay
 	return day, nil
 }
 
-func GetValidators(ctx context.Context, client *http.Service, stateID string) (map[phase0.ValidatorIndex]*v1.Validator, error) {
+func GetValidators(ctx context.Context, client *ethHttp.Service, stateID string) (map[phase0.ValidatorIndex]*v1.Validator, error) {
 	validatorsCacheMu.Lock()
 	defer validatorsCacheMu.Unlock()
 
@@ -173,27 +220,38 @@ func GetValidators(ctx context.Context, client *http.Service, stateID string) (m
 	if found {
 		return val.(map[phase0.ValidatorIndex]*v1.Validator), nil
 	}
-	vals, err := client.Validators(ctx, stateID, nil)
+	vals, err := client.Validators(ctx, &api.ValidatorsOpts{State: stateID})
 	if err != nil {
 		return nil, fmt.Errorf("error getting validators for slot %v: %w", stateID, err)
 	}
-	validatorsCache.Add(key, vals)
-	return vals, nil
+	validatorsCache.Add(key, vals.Data)
+	return vals.Data, nil
 }
 
 type BlockData struct {
+	Version       spec.DataVersion
 	ProposerIndex phase0.ValidatorIndex
+	ParentRoot    phase0.Root
 	Transactions  []bellatrix.Transaction
-	BaseFeePerGas [32]byte
+	BaseFeePerGas *big.Int
 	Deposits      []*phase0.Deposit
 	GasUsed       uint64
 	GasLimit      uint64
 	Withdrawals   []*capella.Withdrawal
 	BlockNumber   uint64
+	// ExecutionBlockHash is the execution block the beacon block commits to:
+	// its payload's hash before Gloas, its bid's block hash from Gloas on.
+	ExecutionBlockHash phase0.Hash32
+	// From Gloas on, the payload is not in the block body: Transactions,
+	// BaseFeePerGas, GasUsed, GasLimit, Withdrawals and BlockNumber stay unset,
+	// and the payload has to be read from the execution layer.
+	// ParentExecutionBlockHash comes from the bid and is only set from Gloas on.
+	ParentExecutionBlockHash phase0.Hash32
 }
 
 func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 	d := &BlockData{}
+	d.Version = block.Version
 	switch block.Version {
 	case spec.DataVersionPhase0:
 		d.Deposits = block.Phase0.Message.Body.Deposits
@@ -206,42 +264,97 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.ProposerIndex = block.Bellatrix.Message.ProposerIndex
 		d.GasUsed = block.Bellatrix.Message.Body.ExecutionPayload.GasUsed
 		d.GasLimit = block.Bellatrix.Message.Body.ExecutionPayload.GasLimit
-		d.BaseFeePerGas = block.Bellatrix.Message.Body.ExecutionPayload.BaseFeePerGas
+		baseFeePerGasBEBytes := make([]byte, len(block.Bellatrix.Message.Body.ExecutionPayload.BaseFeePerGas))
+		for i := 0; i < 32; i++ {
+			baseFeePerGasBEBytes[i] = block.Bellatrix.Message.Body.ExecutionPayload.BaseFeePerGas[32-1-i]
+		}
+		d.BaseFeePerGas = new(big.Int).SetBytes(baseFeePerGasBEBytes)
 		d.BlockNumber = block.Bellatrix.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Bellatrix.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Bellatrix.Message.ParentRoot
 		d.Transactions = block.Bellatrix.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionCapella:
 		d.Deposits = block.Capella.Message.Body.Deposits
 		d.ProposerIndex = block.Capella.Message.ProposerIndex
 		d.GasUsed = block.Capella.Message.Body.ExecutionPayload.GasUsed
 		d.GasLimit = block.Capella.Message.Body.ExecutionPayload.GasLimit
-		d.BaseFeePerGas = block.Capella.Message.Body.ExecutionPayload.BaseFeePerGas
+		baseFeePerGasBEBytes := make([]byte, len(block.Capella.Message.Body.ExecutionPayload.BaseFeePerGas))
+		for i := 0; i < 32; i++ {
+			baseFeePerGasBEBytes[i] = block.Capella.Message.Body.ExecutionPayload.BaseFeePerGas[32-1-i]
+		}
+		d.BaseFeePerGas = new(big.Int).SetBytes(baseFeePerGasBEBytes)
 		d.Withdrawals = block.Capella.Message.Body.ExecutionPayload.Withdrawals
 		d.BlockNumber = block.Capella.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Capella.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Capella.Message.ParentRoot
 		d.Transactions = block.Capella.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionDeneb:
+		d.Deposits = block.Deneb.Message.Body.Deposits
+		d.ProposerIndex = block.Deneb.Message.ProposerIndex
+		d.GasUsed = block.Deneb.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Deneb.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Deneb.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
+		d.Withdrawals = block.Deneb.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Deneb.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Deneb.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Deneb.Message.ParentRoot
+		d.Transactions = block.Deneb.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionElectra:
+		d.Deposits = block.Electra.Message.Body.Deposits
+		d.ProposerIndex = block.Electra.Message.ProposerIndex
+		d.GasUsed = block.Electra.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Electra.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Electra.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
+		d.Withdrawals = block.Electra.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Electra.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Electra.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Electra.Message.ParentRoot
+		d.Transactions = block.Electra.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionFulu:
+		d.Deposits = block.Fulu.Message.Body.Deposits
+		d.ProposerIndex = block.Fulu.Message.ProposerIndex
+		d.GasUsed = block.Fulu.Message.Body.ExecutionPayload.GasUsed
+		d.GasLimit = block.Fulu.Message.Body.ExecutionPayload.GasLimit
+		d.BaseFeePerGas = block.Fulu.Message.Body.ExecutionPayload.BaseFeePerGas.ToBig()
+		d.Withdrawals = block.Fulu.Message.Body.ExecutionPayload.Withdrawals
+		d.BlockNumber = block.Fulu.Message.Body.ExecutionPayload.BlockNumber
+		d.ExecutionBlockHash = block.Fulu.Message.Body.ExecutionPayload.BlockHash
+		d.ParentRoot = block.Fulu.Message.ParentRoot
+		d.Transactions = block.Fulu.Message.Body.ExecutionPayload.Transactions
+	case spec.DataVersionGloas:
+		if block.Gloas.Message.Body.SignedExecutionPayloadBid == nil || block.Gloas.Message.Body.SignedExecutionPayloadBid.Message == nil {
+			return nil, fmt.Errorf("gloas block at slot %v has no execution payload bid", block.Gloas.Message.Slot)
+		}
+		bid := block.Gloas.Message.Body.SignedExecutionPayloadBid.Message
+		d.Deposits = block.Gloas.Message.Body.Deposits
+		d.ProposerIndex = block.Gloas.Message.ProposerIndex
+		d.ParentRoot = block.Gloas.Message.ParentRoot
+		d.ExecutionBlockHash = bid.BlockHash
+		d.ParentExecutionBlockHash = bid.ParentBlockHash
 	default:
 		return nil, fmt.Errorf("unknown block version: %v", block.Version)
 	}
 	return d, nil
 }
 
-func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int) (*Day, map[uint64]*Day, error) {
+func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurrency int, receiptsMode int) (*Day, map[uint64]*Day, error) {
 	gethRpcClient, err := gethRPC.Dial(elAddress)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	service, err := http.New(ctx, http.WithAddress(bnAddress), http.WithTimeout(GetConsTimeout()), http.WithLogLevel(zerolog.WarnLevel))
+	service, err := ethHttp.New(ctx, ethHttp.WithAddress(bnAddress), ethHttp.WithTimeout(GetConsTimeout()), ethHttp.WithLogLevel(zerolog.WarnLevel))
 	if err != nil {
 		return nil, nil, err
 	}
-	client := service.(*http.Service)
+	client := service.(*ethHttp.Service)
 
-	apiSpec, err := client.Spec(ctx)
+	apiSpec, err := client.Spec(ctx, &api.SpecOpts{})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("error getting spec: %w", err)
 	}
 
-	genesisForkVersionIf, exists := apiSpec["GENESIS_FORK_VERSION"]
+	genesisForkVersionIf, exists := apiSpec.Data["GENESIS_FORK_VERSION"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined GENESIS_FORK_VERSION in spec")
 	}
@@ -250,7 +363,41 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, fmt.Errorf("invalid format of GENESIS_FORK_VERSION in spec")
 	}
 
-	domainDepositIf, exists := apiSpec["DOMAIN_DEPOSIT"]
+	beaconchainApiNetworkName := "mainnet"
+	switch fmt.Sprintf("%#x", genesisForkVersion) {
+	case "0x00000000":
+		beaconchainApiNetworkName = "mainnet"
+	case "0x00000064":
+		beaconchainApiNetworkName = "gnosis"
+	case "0x10000910":
+		beaconchainApiNetworkName = "hoodi"
+	default:
+		if GetBeaconchainApiBaseUrl() == "" {
+			return nil, nil, fmt.Errorf("unsupported GENESIS_FORK_VERSION: %s (only mainnet, gnosis, hoodi, or set a beaconchain API base URL)", fmt.Sprintf("%#x", genesisForkVersion))
+		}
+	}
+
+	electraForkEpoch := uint64(math.MaxUint64)
+	electraForkEpochStr, exists := apiSpec.Data["ELECTRA_FORK_EPOCH"]
+	if exists {
+		var ok bool
+		electraForkEpoch, ok = electraForkEpochStr.(uint64)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid format of ELECTRA_FORK_EPOCH in spec")
+		}
+	}
+
+	gloasForkEpoch := uint64(math.MaxUint64)
+	gloasForkEpochStr, exists := apiSpec.Data["GLOAS_FORK_EPOCH"]
+	if exists {
+		var ok bool
+		gloasForkEpoch, ok = gloasForkEpochStr.(uint64)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid format of GLOAS_FORK_EPOCH in spec")
+		}
+	}
+
+	domainDepositIf, exists := apiSpec.Data["DOMAIN_DEPOSIT"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined DOMAIN_DEPOSIT in spec")
 	}
@@ -265,7 +412,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, err
 	}
 
-	slotsPerEpochIf, exists := apiSpec["SLOTS_PER_EPOCH"]
+	slotsPerEpochIf, exists := apiSpec.Data["SLOTS_PER_EPOCH"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined SLOTS_PER_EPOCH in spec")
 	}
@@ -274,7 +421,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, fmt.Errorf("invalid format of SLOTS_PER_EPOCH in spec")
 	}
 
-	secondsPerSlotIf, exists := apiSpec["SECONDS_PER_SLOT"]
+	secondsPerSlotIf, exists := apiSpec.Data["SECONDS_PER_SLOT"]
 	if !exists {
 		return nil, nil, fmt.Errorf("undefined SECONDS_PER_SLOT in spec")
 	}
@@ -286,11 +433,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	slotsPerDay := 3600 * 24 / secondsPerSlot
 
-	finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
+	//finalizedHeader, err := client.BeaconBlockHeader(ctx, "finalized")
+	finalizedHeader, err := client.BeaconBlockHeader(ctx, &api.BeaconBlockHeaderOpts{Block: "finalized"})
 	if err != nil {
 		return nil, nil, err
 	}
-	finalizedSlot := uint64(finalizedHeader.Header.Message.Slot)
+	finalizedSlot := uint64(finalizedHeader.Data.Header.Message.Slot)
 	finalizedDay := finalizedSlot/slotsPerDay - 1
 
 	var day uint64
@@ -321,6 +469,11 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	lastEpoch := lastSlot / slotsPerEpoch
 	endEpoch := lastEpoch + 1
 
+	// the gloas payload at endSlot is only decided by a later block
+	if gloasForkEpoch <= endEpoch && finalizedSlot <= endSlot {
+		return nil, nil, fmt.Errorf("%w: day %v ends at the finalized slot %v", ErrPayloadsNotFinalized, day, finalizedSlot)
+	}
+
 	genesis, err := client.GenesisTime(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error getting genesisTime: %w", err)
@@ -329,11 +482,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	endTime := time.Unix(genesis.Unix()+int64(lastSlot)*int64(secondsPerSlot), 0)
 
 	if GetDebugLevel() > 0 {
-		log.Printf("DEBUG eth.store: calculating day %v (%v - %v, epochs: %v-%v, slots: %v-%v, genesis: %v, finalizedSlot: %v)\n", day, startTime, endTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis, finalizedSlot)
+		log.Printf("DEBUG eth.store: calculating day %v (%v - %v, epochs: %v-%v, slots: %v-%v, genesis: %v, finalizedSlot: %v, beaconchainApiNetworkName: %s, genesisForkVersion: %#x)\n", day, startTime, endTime, firstEpoch, lastEpoch, firstSlot, lastSlot, genesis, finalizedSlot, beaconchainApiNetworkName, genesisForkVersion)
 	}
 
 	validatorsByIndex := map[phase0.ValidatorIndex]*Validator{}
-	validatorsByPubkey := map[phase0.BLSPubKey]*Validator{}
+	validatorsByPubkey := map[string]*Validator{}
+	validatorsMu := sync.Mutex{}
 
 	startValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", firstSlot))
 	if err != nil {
@@ -352,7 +506,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			TxFeesSumWei:         new(big.Int),
 		}
 		validatorsByIndex[val.Index] = vv
-		validatorsByPubkey[val.Validator.PublicKey] = vv
+		validatorsByPubkey[val.Validator.PublicKey.String()] = vv
 	}
 
 	endValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", endSlot))
@@ -368,7 +522,13 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		if uint64(val.Validator.ExitEpoch) < endEpoch {
 			// do not account validators that have not been active until the end of the day
 			delete(validatorsByIndex, val.Index)
-			delete(validatorsByPubkey, val.Validator.PublicKey)
+			delete(validatorsByPubkey, val.Validator.PublicKey.String())
+			continue
+		}
+		if v.EffectiveBalanceGwei != val.Validator.EffectiveBalance {
+			// effective balance changed during the day, do not account this validator
+			delete(validatorsByIndex, val.Index)
+			delete(validatorsByPubkey, val.Validator.PublicKey.String())
 			continue
 		}
 		// set endBalance of validator to the balance of the first epoch of the next day
@@ -380,41 +540,148 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	g := new(errgroup.Group)
 	g.SetLimit(concurrency)
-	validatorsMu := sync.Mutex{}
 
-	// get all deposits and txs of all active validators in the slot interval [startSlot,endSlot)
-	for i := firstSlot; i < endSlot; i++ {
+	payloadBlocks := []*payloadBlock{}
+	hasGloas := false
+	payloadBlocksMu := sync.Mutex{}
+
+	if uint64(electraForkEpoch) <= lastEpoch {
+		if GetDebugLevel() > 0 {
+			log.Printf("DEBUG eth.store: fetching deposits and consolidation requests (electraForkEpoch: %v)\n", electraForkEpoch)
+		}
+		g.Go(func() error {
+			beaconchainApiGroup := new(errgroup.Group)
+			beaconchainApiGroup.SetLimit(10)
+
+			for i := firstEpoch + 1; i <= lastEpoch+1; i++ {
+				i := i
+				if i == 0 {
+					continue
+				}
+				beaconchainApiGroup.Go(func() error {
+					var err error
+					depositRequests, err := beaconchainApiClient.DepositRequests(ctx, beaconchainApiNetworkName, i*slotsPerEpoch-1)
+					if err != nil {
+						return fmt.Errorf("error getting depositRequests for epoch %v (slot %v): %w", i, i*slotsPerEpoch-1, err)
+					}
+					if GetDebugLevel() > 1 {
+						for _, d := range depositRequests.Data {
+							log.Printf("DEBUG eth.store: depositRequest for epoch %v (slot %v): %v\n", i, i*slotsPerEpoch-1, d)
+						}
+					}
+					validatorsMu.Lock()
+					defer validatorsMu.Unlock()
+					for _, d := range depositRequests.Data {
+						v, exists := validatorsByPubkey[d.Pubkey]
+						if exists {
+							// only calculate for validators that have been active the whole day
+							v.DepositsSumGwei += phase0.Gwei(d.Amount)
+						}
+					}
+					return nil
+				})
+				beaconchainApiGroup.Go(func() error {
+					var err error
+					consolidationRequests, err := beaconchainApiClient.ConsolidationRequests(ctx, beaconchainApiNetworkName, i*slotsPerEpoch-1)
+					if err != nil {
+						return fmt.Errorf("error getting consolidationRequests for epoch %v (slot %v): %w", i, i*slotsPerEpoch-1, err)
+					}
+					if GetDebugLevel() > 1 {
+						for _, d := range consolidationRequests.Data {
+							log.Printf("DEBUG eth.store: consolidationRequest for epoch %v (slot %v): %v\n", i, i*slotsPerEpoch-1, d)
+						}
+					}
+					validatorsMu.Lock()
+					defer validatorsMu.Unlock()
+					for _, d := range consolidationRequests.Data {
+						vSource, exists := validatorsByIndex[phase0.ValidatorIndex(d.SourceIndex)]
+						if exists {
+							// only calculate for validators that have been active the whole day
+							vSource.WithdrawalsSumGwei += phase0.Gwei(d.AmountConsolidated)
+						}
+						vTarget, exists := validatorsByIndex[phase0.ValidatorIndex(d.TargetIndex)]
+						if exists {
+							// only calculate for validators that have been active the whole day
+							vTarget.DepositsSumGwei += phase0.Gwei(d.AmountConsolidated)
+						}
+					}
+					return nil
+				})
+			}
+
+			if err := beaconchainApiGroup.Wait(); err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+
+	// Get all deposits, withdrawals and txs of all active validators of this day. The two
+	// groups deliberately use different slot intervals:
+	//
+	//   - Tx fees are not part of the balance delta, so they use the published window of
+	//     epochs [SE,EE), which is the blocks in [firstSlot,endSlot).
+	//
+	//   - Deposits and withdrawals adjust that balance delta, so they have to match the
+	//     two states it is read from. Those are post-block states, so block firstSlot is
+	//     already in the start balance and block endSlot is already in the end balance:
+	//     the blocks in (firstSlot,endSlot].
+	//
+	// Using [firstSlot,endSlot) for the second group counts the withdrawals of block
+	// firstSlot a second time and misses those of block endSlot. A missed withdrawal is
+	// subtracted from the end balance without ever being added back, so it surfaces as a
+	// penalty of its own size: on mainnet day 2110 (2026-09-11) a 995.8 ETH EIP-7002
+	// withdrawal request was processed in block endSlot and pushed the reported apr from
+	// 2.65% down to 1.78%.
+	for i := firstSlot; i <= endSlot; i++ {
 		i := i
 		if GetDebugLevel() > 0 && (endSlot-i)%1000 == 0 {
 			log.Printf("DEBUG eth.store: checking blocks for deposits and txs: %.0f%% (%v of %v-%v)\n", 100*float64(i-firstSlot)/float64(endSlot-firstSlot), i, firstSlot, endSlot)
 		}
 		g.Go(func() error {
+			var blockData *BlockData
+
+			var blockRes *api.Response[*spec.VersionedSignedBeaconBlock]
 			var block *spec.VersionedSignedBeaconBlock
 			var err error
 			for j := 0; j < 10; j++ { // retry up to 10 times on failure
-				block, err = client.SignedBeaconBlock(ctx, fmt.Sprintf("%d", i))
-
+				blockRes, err = client.SignedBeaconBlock(ctx, &api.SignedBeaconBlockOpts{Block: fmt.Sprintf("%d", i)})
 				if err == nil {
 					break
 				} else {
-					log.Printf("error retrieving beacon block at slot %v: %v", i, err)
-					time.Sleep(time.Duration(j) * time.Second)
+					var apiErr *api.Error
+					if errors.As(err, &apiErr) {
+						switch apiErr.StatusCode {
+						case 404:
+							// block not found
+							return nil
+						default:
+							log.Printf("error retrieving beacon block at slot %v: %v", i, err)
+							time.Sleep(time.Duration(j) * time.Second)
+						}
+					}
 				}
 			}
 			if err != nil {
 				return fmt.Errorf("error getting block %v: %w", i, err)
 			}
+			block = blockRes.Data
 			if block == nil {
 				return nil
 			}
-			blockData, err := GetBlockData(block)
+			blockData, err = GetBlockData(block)
 			if err != nil {
 				return fmt.Errorf("error getting blockData for block at slot %v: %w", i, err)
 			}
 
+			payloadBlocksMu.Lock()
+			payloadBlocks = append(payloadBlocks, newPayloadBlock(i, blockData))
+			hasGloas = hasGloas || blockData.Version >= spec.DataVersionGloas
+			payloadBlocksMu.Unlock()
+
 			v, exists := validatorsByIndex[blockData.ProposerIndex]
 			// only calculate for validators that have been active the whole day
-			if exists && len(blockData.Transactions) > 0 {
+			if i < endSlot && exists && len(blockData.Transactions) > 0 {
 				txHashes := []common.Hash{}
 				for _, tx := range blockData.Transactions {
 					var decTx gethTypes.Transaction
@@ -425,56 +692,29 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 					txHashes = append(txHashes, decTx.Hash())
 				}
 
-				var txReceipts []*TxReceipt
-				for j := 0; j < 10; j++ { // retry up to 10 times
-					ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
-					txReceipts, err = batchRequestReceipts(ctx, gethRpcClient, txHashes)
-					if err == nil {
-						cancel()
-						break
-					} else {
-						log.Printf("error doing batchRequestReceipts for slot %v: %v", i, err)
-						time.Sleep(time.Duration(j) * time.Second)
-					}
-					cancel()
-				}
+				totalTxFee, err := txFeesWei(gethRpcClient, receiptsMode, i, txHashes, blockData.BlockNumber, blockData.BaseFeePerGas, blockData.GasUsed)
 				if err != nil {
-					return fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", i, err)
+					return err
 				}
-
-				totalTxFee := big.NewInt(0)
-				for _, r := range txReceipts {
-					if r.EffectiveGasPrice == nil {
-						return fmt.Errorf("no EffectiveGasPrice for slot %v: %v", i, txHashes)
-					}
-					txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
-					totalTxFee.Add(totalTxFee, txFee)
-				}
-
-				// base fee per gas is stored little-endian but we need it
-				// big-endian for big.Int.
-				var baseFeePerGasBEBytes [32]byte
-				for i := 0; i < 32; i++ {
-					baseFeePerGasBEBytes[i] = blockData.BaseFeePerGas[32-1-i]
-				}
-				baseFeePerGas := new(big.Int).SetBytes(baseFeePerGasBEBytes[:])
-				burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(blockData.GasUsed))
-
-				totalTxFee.Sub(totalTxFee, burntFee)
 
 				validatorsMu.Lock()
 				v.TxFeesSumWei.Add(v.TxFeesSumWei, totalTxFee)
 				validatorsMu.Unlock()
 
 				if GetDebugLevel() > 1 {
-					log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v, burnt: %v\n", i, blockData.BlockNumber, baseFeePerGas, totalTxFee, burntFee)
+					log.Printf("DEBUG eth.store: slot: %v, block: %v, baseFee: %v, txFees: %v\n", i, blockData.BlockNumber, blockData.BaseFeePerGas, totalTxFee)
 				}
+			}
+
+			if i == firstSlot {
+				// block firstSlot is already part of the start balance
+				return nil
 			}
 
 			validatorsMu.Lock()
 			defer validatorsMu.Unlock()
 			for _, d := range blockData.Deposits {
-				v, exists := validatorsByPubkey[d.Data.PublicKey]
+				v, exists := validatorsByPubkey[d.Data.PublicKey.String()]
 				if !exists {
 					// only calculate for validators that have been active the whole day
 					continue
@@ -509,8 +749,16 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			return nil
 		})
 	}
+
 	if err := g.Wait(); err != nil {
 		return nil, nil, err
+	}
+
+	if hasGloas {
+		err = accountGloasPayloads(ctx, client, gethRpcClient, receiptsMode, concurrency, payloadBlocks, firstSlot, endSlot, finalizedSlot, validatorsByIndex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error accounting gloas payloads: %w", err)
+		}
 	}
 
 	var totalEffectiveBalanceGwei phase0.Gwei
@@ -532,6 +780,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 		validatorConsensusRewardsGwei := decimal.NewFromInt(int64(v.EndBalanceGwei) - int64(v.StartBalanceGwei) - int64(v.DepositsSumGwei) + int64(v.WithdrawalsSumGwei))
 		validatorRewardsWei := decimal.NewFromBigInt(v.TxFeesSumWei, 0).Add(validatorConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
+
+		if validatorRewardsWei.LessThan(decimal.Zero) {
+			if GetDebugLevel() > 1 {
+				log.Printf("DEBUG eth.store: negative rewards for validator %v: %v -- %+v\n", v.Index, validatorRewardsWei, *v)
+			}
+		}
 
 		ethstorePerValidator[uint64(index)] = &Day{
 			Day:                  decimal.NewFromInt(int64(day)),
@@ -576,6 +830,81 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	return ethstoreDay, ethstorePerValidator, nil
 }
 
+// txFeesWei returns the priority fees paid in a block: the fees of its
+// receipts minus the burnt base fee.
+func txFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64, baseFeePerGas *big.Int, gasUsed uint64) (*big.Int, error) {
+	txReceipts, err := requestReceiptsWithRetry(elClient, receiptsMode, slot, txHashes, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	totalTxFee := big.NewInt(0)
+	for _, r := range txReceipts {
+		if r.EffectiveGasPrice == nil {
+			return nil, fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", slot, *r)
+		}
+		txFee := new(big.Int).Mul(r.EffectiveGasPrice.ToInt(), new(big.Int).SetUint64(uint64(r.GasUsed)))
+		totalTxFee.Add(totalTxFee, txFee)
+	}
+
+	burntFee := new(big.Int).Mul(baseFeePerGas, new(big.Int).SetUint64(gasUsed))
+	return totalTxFee.Sub(totalTxFee, burntFee), nil
+}
+
+// priorityFeesWei returns the priority fees paid in a block as the sum of each
+// receipt's tip. Unlike txFeesWei it does not take the burn from the header's
+// gasUsed, which from Amsterdam on differs from the gas the receipts charged.
+// Before Amsterdam both give the same result, and pre-fork blocks keep txFeesWei.
+func priorityFeesWei(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64, baseFeePerGas *big.Int) (*big.Int, error) {
+	txReceipts, err := requestReceiptsWithRetry(elClient, receiptsMode, slot, txHashes, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	total := big.NewInt(0)
+	for _, r := range txReceipts {
+		if r.EffectiveGasPrice == nil {
+			return nil, fmt.Errorf("no EffectiveGasPrice for slot %v: %+v", slot, *r)
+		}
+		tip := new(big.Int).Sub(r.EffectiveGasPrice.ToInt(), baseFeePerGas)
+		total.Add(total, tip.Mul(tip, new(big.Int).SetUint64(uint64(r.GasUsed))))
+	}
+	return total, nil
+}
+
+func requestReceiptsWithRetry(elClient *gethRPC.Client, receiptsMode int, slot uint64, txHashes []common.Hash, blockNumber uint64) ([]*TxReceipt, error) {
+	var txReceipts []*TxReceipt
+	var err error
+	for j := 0; j < 10; j++ { // retry up to 10 times
+		ctx, cancel := context.WithTimeout(context.Background(), GetExecTimeout())
+
+		if receiptsMode == RECEIPTS_MODE_BATCH {
+			txReceipts, err = batchRequestReceipts(ctx, elClient, txHashes)
+			if err == nil {
+				cancel()
+				break
+			} else {
+				log.Printf("error doing batchRequestReceipts for slot %v: %v", slot, err)
+				time.Sleep(time.Duration(j) * time.Second)
+			}
+		} else if receiptsMode == RECEIPTS_MODE_SINGLE {
+			txReceipts, err = requestReceipts(ctx, elClient, blockNumber)
+			if err == nil {
+				cancel()
+				break
+			} else {
+				log.Printf("error doing requestReceipts for slot %v: %v", slot, err)
+				time.Sleep(time.Duration(j) * time.Second)
+			}
+		}
+		cancel()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error doing batchRequestReceipts for slot %v: %w", slot, err)
+	}
+	return txReceipts, nil
+}
+
 func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashes []common.Hash) ([]*TxReceipt, error) {
 	elems := make([]gethRPC.BatchElem, 0, len(txHashes))
 	errors := make([]error, 0, len(txHashes))
@@ -604,6 +933,16 @@ func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashe
 	return txReceipts, nil
 }
 
+func requestReceipts(ctx context.Context, elClient *gethRPC.Client, blockNumber uint64) ([]*TxReceipt, error) {
+	txReceipts := make([]*TxReceipt, 0)
+
+	ioErr := elClient.CallContext(ctx, &txReceipts, "eth_getBlockReceipts", blockNumber)
+	if ioErr != nil {
+		return nil, fmt.Errorf("io-error when fetching tx-receipts: %w", ioErr)
+	}
+	return txReceipts, nil
+}
+
 type TxReceipt struct {
 	BlockHash         *common.Hash    `json:"blockHash"`
 	BlockNumber       *hexutil.Big    `json:"blockNumber"`
@@ -618,4 +957,333 @@ type TxReceipt struct {
 	TransactionHash   *common.Hash    `json:"transactionHash"`
 	TransactionIndex  hexutil.Uint64  `json:"transactionIndex"`
 	Type              hexutil.Uint64  `json:"type"`
+}
+
+type BeaconchainApiClient struct {
+	apikey              string
+	apikeyMu            sync.Mutex
+	domain              string
+	domainMu            sync.Mutex
+	baseUrl             string
+	baseUrlMu           sync.Mutex
+	ratelimiter         *Ratelimiter
+	ratelimitFraction   float64
+	ratelimitFractionMu sync.Mutex
+}
+
+func NewBeaconchainApiClient() *BeaconchainApiClient {
+	c := &BeaconchainApiClient{
+		apikey:            "",
+		domain:            "beaconcha.in",
+		ratelimiter:       NewRatelimiter(1),
+		ratelimitFraction: defaultRatelimitTargetFraction,
+	}
+	return c
+}
+
+func (c *BeaconchainApiClient) SetDomain(domain string) {
+	c.domainMu.Lock()
+	defer c.domainMu.Unlock()
+	c.domain = domain
+}
+
+func (c *BeaconchainApiClient) GetDomain() string {
+	c.domainMu.Lock()
+	defer c.domainMu.Unlock()
+	return c.domain
+}
+
+func (c *BeaconchainApiClient) SetBaseUrl(baseUrl string) {
+	c.baseUrlMu.Lock()
+	defer c.baseUrlMu.Unlock()
+	c.baseUrl = strings.TrimRight(baseUrl, "/")
+}
+
+func (c *BeaconchainApiClient) GetBaseUrl() string {
+	c.baseUrlMu.Lock()
+	defer c.baseUrlMu.Unlock()
+	return c.baseUrl
+}
+
+func (c *BeaconchainApiClient) slotUrl(network string, slot uint64, resource string) string {
+	if baseUrl := c.GetBaseUrl(); baseUrl != "" {
+		return fmt.Sprintf("%s/api/v1/slot/%d/%s", baseUrl, slot, resource)
+	}
+	return fmt.Sprintf("https://%s.%s/api/v1/slot/%d/%s", network, c.GetDomain(), slot, resource)
+}
+
+func (c *BeaconchainApiClient) SetApiKey(apiKey string) {
+	c.apikeyMu.Lock()
+	defer c.apikeyMu.Unlock()
+	c.apikey = apiKey
+}
+
+func (c *BeaconchainApiClient) GetApiKey() string {
+	c.apikeyMu.Lock()
+	defer c.apikeyMu.Unlock()
+	return c.apikey
+}
+
+// SetRatelimitTargetFraction sets the share of the API's advertised per-second
+// limit this client paces itself to. Lower it when multiple processes share
+// one API key. Values outside (0, 1] are ignored.
+func (c *BeaconchainApiClient) SetRatelimitTargetFraction(fraction float64) {
+	if fraction <= 0 || fraction > 1 {
+		return
+	}
+	c.ratelimitFractionMu.Lock()
+	defer c.ratelimitFractionMu.Unlock()
+	c.ratelimitFraction = fraction
+}
+
+func (c *BeaconchainApiClient) GetRatelimitTargetFraction() float64 {
+	c.ratelimitFractionMu.Lock()
+	defer c.ratelimitFractionMu.Unlock()
+	return c.ratelimitFraction
+}
+
+// defaultRatelimitTargetFraction is the share of the API's advertised
+// per-second limit this client paces itself to. The limit applies per API key
+// and every process sharing a key draws on one budget, so lower it via
+// SetRatelimitTargetFraction when several processes share a key.
+const defaultRatelimitTargetFraction = .9
+
+// httpReqMaxAttempts bounds the 429 retries in HttpReq, so a genuinely
+// exhausted or misconfigured limit still fails instead of retrying forever.
+const httpReqMaxAttempts = 5
+
+// httpReqFallbackRetryDelay is used when a 429 carries no usable
+// ratelimit-reset header.
+const httpReqFallbackRetryDelay = time.Second
+
+// httpReqMaxRetryDelay bounds how long a single retry may wait. A 429 can
+// carry a ratelimit-reset for a larger window (hour, month), where waiting it
+// out would hang the caller for hours; failing fast keeps the error visible.
+const httpReqMaxRetryDelay = 10 * time.Second
+
+// HttpReq performs the request, retrying while the API answers 429.
+//
+// A single 429 used to fail the caller outright, which discarded a whole
+// eth.store day: the deposit and consolidation requests for one day are ~450
+// calls, and losing any one of them re-runs all of them. Retrying is safe here
+// because every caller is an idempotent GET.
+//
+// Each attempt re-enters httpReq and so passes through c.ratelimiter.Wait(),
+// which paces retries with all other in-flight requests instead of letting the
+// concurrent callers stampede on recovery.
+func (c *BeaconchainApiClient) HttpReq(ctx context.Context, method, url string, headers map[string]string, params, result interface{}) error {
+	var err error
+	for attempt := 0; attempt < httpReqMaxAttempts; attempt++ {
+		err = c.httpReq(ctx, method, url, headers, params, result)
+
+		var reqErr HttpReqError
+		if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusTooManyRequests {
+			return err
+		}
+		if attempt == httpReqMaxAttempts-1 {
+			return err
+		}
+
+		delay := reqErr.RetryAfter
+		if delay <= 0 {
+			delay = httpReqFallbackRetryDelay
+		} else if delay > httpReqMaxRetryDelay {
+			// The offending window rolls over too far in the future for a
+			// retry to help; fail fast instead of sleeping it out.
+			return err
+		}
+		if GetDebugLevel() > 0 {
+			log.Printf("DEBUG eth.store: ratelimited, retrying in %v (attempt %d/%d): %v\n", delay, attempt+1, httpReqMaxAttempts, url)
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func (c *BeaconchainApiClient) httpReq(ctx context.Context, method, url string, headers map[string]string, params, result interface{}) error {
+	c.ratelimiter.Wait()
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	headers["apikey"] = c.GetApiKey()
+
+	var err error
+	var req *http.Request
+	if params != nil {
+		paramsJSON, err := json.Marshal(params)
+		if err != nil {
+			return HttpReqError{Url: url, HTTPError: fmt.Errorf("error marhsaling params for request: %w", err)}
+		}
+		req, err = http.NewRequestWithContext(ctx, method, url, bytes.NewBuffer(paramsJSON))
+		if err != nil {
+			return HttpReqError{Url: url, HTTPError: fmt.Errorf("error creating request with params: %w", err)}
+		}
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, url, nil)
+		if err != nil {
+			return HttpReqError{Url: url, HTTPError: fmt.Errorf("error creating request: %w", err)}
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	httpClient := &http.Client{Timeout: time.Minute}
+	res, err := httpClient.Do(req)
+	if err != nil {
+		// res is nil whenever Do reports an error, so it must not be dereferenced.
+		return HttpReqError{Url: url, HTTPError: err}
+	}
+
+	rlStr := res.Header.Get("ratelimit-limit")
+	if rlStr != "" {
+		rl, err := strconv.ParseInt(rlStr, 10, 64)
+		if err == nil && rl > 2 {
+			rlFloat := float64(rl) * c.GetRatelimitTargetFraction()
+			if rlFloat != c.ratelimiter.GetRate() {
+				c.ratelimiter.SetRate(rlFloat)
+				if GetDebugLevel() > 0 {
+					log.Printf("DEBUG eth.store: setting beaconchain-ratelimit: %v\n", rlFloat)
+				}
+			}
+		}
+	}
+
+	var retryAfter time.Duration
+	if res.StatusCode == http.StatusTooManyRequests {
+		// ratelimit-reset is the seconds until the offending window rolls over.
+		if secs, convErr := strconv.ParseInt(res.Header.Get("ratelimit-reset"), 10, 64); convErr == nil && secs > 0 {
+			retryAfter = time.Duration(secs) * time.Second
+		}
+		log.Printf("DEBUG eth.store: status: 429, limit: %v, remaining: %v, reset: %v, window: %v, remaining-day: %v, remaining-hour: %v, remaining-minute: %v, remaining-month: %v, remaining-second: %v\n", res.Header.Get("ratelimit-limit"), res.Header.Get("ratelimit-remaining"), res.Header.Get("ratelimit-reset"), res.Header.Get("ratelimit-window"), res.Header.Get("x-ratelimit-remaining-day"), res.Header.Get("x-ratelimit-remaining-hour"), res.Header.Get("x-ratelimit-remaining-minute"), res.Header.Get("x-ratelimit-remaining-month"), res.Header.Get("x-ratelimit-remaining-second"))
+	}
+
+	defer res.Body.Close()
+	if res.StatusCode > 299 {
+		body, _ := io.ReadAll(res.Body)
+		return HttpReqError{StatusCode: res.StatusCode, Url: url, Body: body, RetryAfter: retryAfter}
+	}
+	if result != nil {
+		err = json.NewDecoder(res.Body).Decode(result)
+		if err != nil {
+			return HttpReqError{StatusCode: res.StatusCode, Url: url, JSONError: err}
+		}
+	}
+	return nil
+}
+
+func (c *BeaconchainApiClient) ConsolidationRequests(ctx context.Context, network string, slot uint64) (*BeaconchainConsolidationRequestsResponse, error) {
+	res := &BeaconchainConsolidationRequestsResponse{}
+	err := c.HttpReq(ctx, http.MethodGet, c.slotUrl(network, slot, "consolidation_requests"), nil, nil, res)
+	return res, err
+}
+
+func (c *BeaconchainApiClient) DepositRequests(ctx context.Context, network string, slot uint64) (*BeaconchainDepositRequestsResponse, error) {
+	res := &BeaconchainDepositRequestsResponse{}
+	err := c.HttpReq(ctx, http.MethodGet, c.slotUrl(network, slot, "deposit_requests"), nil, nil, res)
+	return res, err
+}
+
+type BeaconchainDepositRequestsResponse struct {
+	Status string                      `json:"status"`
+	Data   []BeaconchainDepositRequest `json:"data"`
+}
+
+type BeaconchainDepositRequest struct {
+	Amount                int64  `json:"amount"`
+	BlockRoot             string `json:"block_root"`
+	BlockSlot             uint64 `json:"block_slot"`
+	Pubkey                string `json:"pubkey"`
+	RequestIndex          uint64 `json:"request_index"`
+	Signature             string `json:"signature"`
+	WithdrawalCredentials string `json:"withdrawal_credentials"`
+}
+
+type BeaconchainConsolidationRequestsResponse struct {
+	Status string                            `json:"status"`
+	Data   []BeaconchainConsolidationRequest `json:"data"`
+}
+
+type BeaconchainConsolidationRequest struct {
+	AmountConsolidated int64  `json:"amount_consolidated"`
+	BlockRoot          string `json:"block_root"`
+	BlockSlot          uint64 `json:"block_slot"`
+	RequestIndex       uint64 `json:"request_index"`
+	SourceIndex        uint64 `json:"source_index"`
+	TargetIndex        uint64 `json:"target_index"`
+}
+
+type HttpReqError struct {
+	StatusCode int
+	Url        string
+	Body       []byte
+	JSONError  error
+	HTTPError  error
+	// RetryAfter is how long the API asked the caller to wait, taken from the
+	// ratelimit-reset header of a 429. Zero when the response carried none.
+	RetryAfter time.Duration
+}
+
+func (e HttpReqError) Error() string {
+	var bs string
+	if len(e.Body) > 1024 {
+		bs = string(e.Body[:1024]) + "…"
+	} else {
+		bs = string(e.Body)
+	}
+	return fmt.Sprintf("error: statusCode: %v, url: %v, jsonError: %v, httpErro: %v, body: %v", e.StatusCode, e.Url, e.JSONError, e.HTTPError, bs)
+}
+
+type Ratelimiter struct {
+	reqChan     chan int
+	ticker      *time.Ticker
+	reqPerSec   float64
+	reqPerSecMu sync.RWMutex
+}
+
+func NewRatelimiter(reqPerSec float64) *Ratelimiter {
+	rl := &Ratelimiter{}
+	rl.reqPerSecMu = sync.RWMutex{}
+	rl.reqChan = make(chan int, 1)
+	rl.ticker = time.NewTicker(1e9 * time.Second / time.Duration(1e9*reqPerSec))
+	rl.SetRate(reqPerSec)
+	go func() {
+		for range rl.ticker.C {
+			select {
+			case <-rl.reqChan:
+			default:
+			}
+		}
+	}()
+	return rl
+}
+
+func (rl *Ratelimiter) Wait() {
+	rl.reqChan <- 1
+}
+
+func (rl *Ratelimiter) GetRate() float64 {
+	rl.reqPerSecMu.RLock()
+	defer rl.reqPerSecMu.RUnlock()
+	return rl.reqPerSec
+}
+
+func (rl *Ratelimiter) SetRate(reqPerSec float64) {
+	rl.reqPerSecMu.Lock()
+	defer rl.reqPerSecMu.Unlock()
+	if reqPerSec < 0 {
+		return
+	}
+	if rl.reqPerSec == reqPerSec {
+		return
+	}
+	rl.reqPerSec = reqPerSec
+	rl.ticker.Reset(1e9 * time.Second / time.Duration(1e9*rl.reqPerSec))
 }

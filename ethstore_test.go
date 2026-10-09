@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -28,13 +29,17 @@ func TestEthstore(t *testing.T) {
 	// validator 2 activated on the second epoch of day 10
 	// validator 3 activated on the last epoch of day 10 and deposited 32 Eth extra during day 10
 	// validator 4 deposited 100 Eth extra during day 10
-	// therefore only 29 validators (indices 4 to 32) should be considered when calculating the eth.store, which is: 365 * (sumOfEndBalances - sumOfStartBalances - sumOfExtraDeposits + sumOfTxFees) / sumOfEffbalancesAtStart
-	// given our scenario this should result in 365 * (28*32.0032e18+1*32.0032e18+32e18 - 29*32e18 - 1*32e18 + 10000e9*32*225*29/32) / (32e18*29) = 0.0621640625
+	// validator 5 has a withdrawal in the block at firstSlot, which is the last block of day 9
+	// validator 6 starts with an extra 1000 Eth and withdraws it in the block at endSlot, which is the last block of day 10
+	// therefore only 29 validators (indices 4 to 32) should be considered when calculating the eth.store, which is: 365 * (sumOfEndBalances - sumOfStartBalances - sumOfExtraDeposits + sumOfWithdrawals + sumOfTxFees) / sumOfEffbalancesAtStart
+	// given our scenario this should result in 365 * (28*32.0032e18+1*32.0032e18+32e18 - 29*32e18 - 1000e18 - 1*32e18 + 1000e18 + 10000e9*32*225*29/32) / (32e18*29) = 0.0621640625
 	// explaining the numbers:
 	// - 365 is the number of days in a year (we ignore leap-years for apr-calculation of eth.store)
 	// - 28*32.0032e18+1*32.0032e18+32e18 = sumOfEndBalances = 28 validators each with a balance of 32.0032 eth at the end of the day and one validator deposited extra 100 eth - which is added to the endBalance of the validator
 	// - 29*32e18 = sumOfStartBalances = 29 validators each with 32 eth start balance
 	// - 1*32e18 = sumOfExtraDeposits = 1 validator deposited 100 eth extra in the set of validators that is considered for the calculation, note that the other deposit should not be considered
+	// - 1000e18 = the extra 1000 eth validator 6 holds at the start of the day and withdraws again before the end of the day
+	// - 1000e18 = sumOfWithdrawals = only validator 6's withdrawal counts, validator 5's withdrawal is in the block at firstSlot and is therefore already part of its startBalance
 	// - 10000e9*32*225*29/32 = sumOfTxFees = 10000 Gwei tx-fee for txs in 32*225 blocks (32 blocks in 225 epochs), but only 29 of the 32 validators who actually propose blocks are in the eth.store validator-set
 	// - 32e18*29 = sumOfEffectiveBalances = 29 validators have each an effective balance of 32 eth at the start of the eth.store-day
 	// - 0.0621640625 = eth.store-apr = according to the eth.store-calculation validators will earn 6.22% interest in a year
@@ -46,38 +51,45 @@ func TestEthstore(t *testing.T) {
 		"/eth/v1/config/deposit_contract":  `{"data":{"chain_id":"1","address":"0x00000000219ab540356cbb839cbe05303d7705fa"}}`,
 		"/eth/v1/config/fork_schedule":     `{"data":[{"previous_version":"0x00000000","current_version":"0x00000000","epoch":"0"},{"previous_version":"0x00000000","current_version":"0x01000000","epoch":"74240"}]}`,
 		"/eth/v1/node/version":             `{"data":{"version":"Lighthouse/v2.3.1-564d7da/x86_64-linux"}}`,
+		"/eth/v1/node/syncing":             `{"data":{"head_slot":"4485760","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}`,
 		"/eth/v2/beacon/blocks/0":          `{"version":"phase0","data":{"message":{"slot":"0","proposer_index":"0","parent_root":"0x0000000000000000000000000000000000000000000000000000000000000000","state_root":"0x7e76880eb67bbdc86250aa578958e9d0675e64e714337855204fb5abaaf82c2b","body":{"randao_reveal":"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","eth1_data":{"deposit_root":"0x0000000000000000000000000000000000000000000000000000000000000000","deposit_count":"0","block_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"},"graffiti":"0x0000000000000000000000000000000000000000000000000000000000000000","proposer_slashings":[],"attester_slashings":[],"attestations":[],"deposits":[],"voluntary_exits":[]}},"signature":"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}}`,
 	}
 
+	type MockDebugValidator struct {
+		Pubkey                     string `json:"pubkey"`
+		WithdrawalCredentials      string `json:"withdrawal_credentials"`
+		EffectiveBalance           string `json:"effective_balance"`
+		Slashed                    bool   `json:"slashed"`
+		ActivationEligibilityEpoch string `json:"activation_eligibility_epoch"`
+		ActivationEpoch            string `json:"activation_epoch"`
+		ExitEpoch                  string `json:"exit_epoch"`
+		WithdrawableEpoch          string `json:"withdrawable_epoch"`
+	}
+
 	type MockValidator struct {
-		Index     string `json:"index"`
-		Balance   string `json:"balance"`
-		Status    string `json:"status"`
-		Validator struct {
-			Pubkey                     string `json:"pubkey"`
-			WithdrawalCredentials      string `json:"withdrawal_credentials"`
-			EffectiveBalance           string `json:"effective_balance"`
-			Slashed                    bool   `json:"slashed"`
-			ActivationEligibilityEpoch string `json:"activation_eligibility_epoch"`
-			ActivationEpoch            string `json:"activation_epoch"`
-			ExitEpoch                  string `json:"exit_epoch"`
-			WithdrawableEpoch          string `json:"withdrawable_epoch"`
-		} `json:"validator"`
+		Index     string              `json:"index"`
+		Balance   string              `json:"balance"`
+		Status    string              `json:"status"`
+		Validator *MockDebugValidator `json:"validator"`
 	}
 
 	type MockValidatorsResponse struct {
-		Data []MockValidator `json:"data"`
+		Data []*MockValidator `json:"data"`
 	}
 
 	txFeeGweiPerBlock := uint64(10000)
 	numValis := 33
 
-	mockStartValidators := MockValidatorsResponse{make([]MockValidator, numValis)}
+	mockStartValidators := MockValidatorsResponse{make([]*MockValidator, numValis)}
+	mockStartDebugValidators := make([]*MockDebugValidator, numValis)
+	mockStartBalances := make([]string, numValis)
+
 	for i := 0; i < numValis; i++ {
-		v := MockValidator{}
+		v := &MockValidator{}
 		v.Index = fmt.Sprintf("%d", i)
 		v.Balance = "32000000000"
 		v.Status = "active_ongoing"
+		v.Validator = &MockDebugValidator{}
 		v.Validator.Pubkey = fmt.Sprintf("%#096x", i)
 		v.Validator.WithdrawalCredentials = fmt.Sprintf("%#064x", i)
 		v.Validator.EffectiveBalance = "32000000000"
@@ -87,14 +99,20 @@ func TestEthstore(t *testing.T) {
 		v.Validator.ExitEpoch = "18446744073709551615"
 		v.Validator.WithdrawableEpoch = "18446744073709551615"
 		mockStartValidators.Data[i] = v
+		mockStartDebugValidators[i] = v.Validator
+		mockStartBalances[i] = v.Balance
 	}
 
-	mockEndValidators := MockValidatorsResponse{make([]MockValidator, numValis)}
+	mockEndValidators := MockValidatorsResponse{make([]*MockValidator, numValis)}
+	mockEndDebugValidators := make([]*MockDebugValidator, numValis)
+	mockEndBalances := make([]string, numValis)
+
 	for i := 0; i < numValis; i++ {
-		v := MockValidator{}
+		v := &MockValidator{}
 		v.Index = fmt.Sprintf("%d", i)
 		v.Balance = "32003200000"
 		v.Status = "active_ongoing"
+		v.Validator = &MockDebugValidator{}
 		v.Validator.Pubkey = fmt.Sprintf("%#096x", i)
 		v.Validator.WithdrawalCredentials = fmt.Sprintf("%#064x", i)
 		v.Validator.EffectiveBalance = "32000000000"
@@ -104,6 +122,8 @@ func TestEthstore(t *testing.T) {
 		v.Validator.ExitEpoch = "18446744073709551615"
 		v.Validator.WithdrawableEpoch = "18446744073709551615"
 		mockEndValidators.Data[i] = v
+		mockEndDebugValidators[i] = v.Validator
+		mockEndBalances[i] = v.Balance
 	}
 
 	// validator 0 exited on the last epoch of day 9
@@ -112,6 +132,7 @@ func TestEthstore(t *testing.T) {
 	mockEndValidators.Data[0].Validator.ExitEpoch = fmt.Sprintf("%d", 10*225-1)
 	mockEndValidators.Data[0].Status = "exited_unslashed"
 	mockEndValidators.Data[0].Balance = "32000000000"
+	mockStartBalances[0] = "32000000000"
 
 	// validator 1 exited on the last epoch of day 10
 	mockEndValidators.Data[1].Validator.ExitEpoch = fmt.Sprintf("%d", 11*225-1)
@@ -131,6 +152,11 @@ func TestEthstore(t *testing.T) {
 	mockStartValidators.Data[4].Validator.Pubkey = "0xb07210c8839f03532d8b7e27a1b0ec9503454fa29a2cbe563896636757214247699420553ce51f78fa9d72d79d0a2fc1"
 	mockEndValidators.Data[4].Validator.Pubkey = "0xb07210c8839f03532d8b7e27a1b0ec9503454fa29a2cbe563896636757214247699420553ce51f78fa9d72d79d0a2fc1"
 	mockEndValidators.Data[4].Balance = "64003200000"
+	mockEndBalances[4] = "64003200000"
+
+	// validator 6 holds an extra 1000 Eth at the start of day 10 and withdraws it in the block at endSlot
+	mockStartValidators.Data[6].Balance = "1032000000000"
+	mockStartBalances[6] = "1032000000000"
 
 	mockStartValidatorsJson, err := json.Marshal(&mockStartValidators)
 	if err != nil {
@@ -145,10 +171,45 @@ func TestEthstore(t *testing.T) {
 	mocks["/eth/v1/beacon/states/72000/validators"] = string(mockStartValidatorsJson)
 	mocks["/eth/v1/beacon/states/79200/validators"] = string(mockEndValidatorsJson)
 
+	mockStartValidatorsDataJson, err := json.Marshal(&mockStartDebugValidators)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mockEndValidatorsDataJson, err := json.Marshal(&mockEndDebugValidators)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mockStartBalancesJson, err := json.Marshal(&mockStartBalances)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mockEndBalancesJson, err := json.Marshal(&mockEndBalances)
+	if err != nil {
+		t.Error(err)
+	}
+
+	mocks["/eth/v2/debug/beacon/states/72000"] = phase0StateJson("72000", mockStartValidatorsDataJson, mockStartBalancesJson)
+	mocks["/eth/v2/debug/beacon/states/79200"] = phase0StateJson("79200", mockEndValidatorsDataJson, mockEndBalancesJson)
+
 	validator4DidExtraDeposit := false
-	for i := 10 * 225 * 32; i < 11*225*32; i++ {
+	// note that the blocks at firstSlot and at endSlot are both mocked: firstSlot belongs to
+	// day 9 and endSlot belongs to day 10, so exactly one of the two withdrawals below may
+	// end up in the result
+	for i := 10 * 225 * 32; i <= 11*225*32; i++ {
 		proposer := i%(numValis-1) + 1 // validator with index 0 does not propose blocks on this day
 		deposits := "[]"
+		withdrawals := "[]"
+		switch i {
+		case 10 * 225 * 32:
+			// validator 5 withdrew 0.016 Eth in the block at firstSlot, which is already part of its startBalance and must not be counted
+			withdrawals = `[{"index":"1","validator_index":"5","address":"0x0000000000000000000000000000000000000005","amount":"16000000"}]`
+		case 11 * 225 * 32:
+			// validator 6 withdrew 1000 Eth in the block at endSlot, which is part of its endBalance and must be counted
+			withdrawals = `[{"index":"2","validator_index":"6","address":"0x0000000000000000000000000000000000000006","amount":"1000000000000"}]`
+		}
 		if proposer == 4 && !validator4DidExtraDeposit {
 			// validator 4 deposited 100 Eth extra during day 10
 			validator4DidExtraDeposit = true
@@ -194,7 +255,7 @@ func TestEthstore(t *testing.T) {
 				"signature": "0xa70b7440dd48d5b0d11e530c63ba307dfa07a011b695e8f0621555e6af85e365da6f7de39f61ad5f13ee9f8b9d5c10990d52cb993eb5ad2e7f0cf7f96a33bc596444972ca5d99e134bbb166fc720a8ca04f3ee9027756f91afacf8d6603cd392"
 			} }]`
 		}
-		mocks[fmt.Sprintf("/eth/v2/beacon/blocks/%d", i)] = fmt.Sprintf(`{"version":"bellatrix","data":{"message":{"slot":"%d","proposer_index":"%d","parent_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","state_root":"0x3c900df8e277bade69a1c29a93f9442940fc5e43a96c60dfc33d0f0a54a73af6","body":{"randao_reveal":"0x886b31ed2d6caead1e6632dcaec7edb113789f81dbc101160f903ad72c01429203c15ae75e00bd6987ca5ec79750f9c6040a7805284b24f5b3fa8131579c743e592033de069345ccb4b9a99fd73712d8b2276791847282dbfb7634fcb050ae80","eth1_data":{"deposit_root":"0x9df92d765b5aa041fd4bbe8d5878eb89290efa78e444c1a603eecfae2ea05fa4","deposit_count":"403","block_hash":"0x4d0d1732d9a72d2127ab2ad120e66da738cab3369239ec9debd7aea3b89f9812"},"graffiti":"0x0000000000000000000000000000000000000000000000000000000000000000","proposer_slashings":[],"attester_slashings":[],"attestations":[{"aggregation_bits":"0xf7fa6fffbcbbbf6f","data":{"slot":"357843","index":"0","beacon_block_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","source":{"epoch":"11181","root":"0xa0d0f93cc58e7e0a6b08c600d2a8054dc41fbadd8aba116e6e8cb1a1870321d0"},"target":{"epoch":"11182","root":"0x82cf146d63ea46194fb6ea4e2c99b244aea76cf8c6546ae09a749a0406d78823"}},"signature":"0xad7d675b775c89fb5c1605f1c91bb595e4feb0a2a0440b23aacfbc6d95daa02e761e8ad48a6cf0dd041d65250a97bf1200e879212f389173cdb2c5792d977411aa44f62eb79e71447f00f2eb02c3aacb4fdc4e939a5d7d01a2198ccdb758b641"}],"deposits":%s,"voluntary_exits":[],"sync_aggregate":{"sync_committee_bits":"0xf74edf53ffdb7f7f7db76efef7fcfb6eff7ffeffbff7f7fddf3f57f7d7fff1b7b7fb3e7bffffff5afe7fffff7fcb437fdffee3efd6dff76df766ffffd7fffff1","sync_committee_signature":"0x98fef94f6488bcb1d1c47517e28683d280c36cfd3caa37403e40a72b0500de7ce84f234760edc17a2bd1031db194570d17af1eb253d4d117f88b39e30ee0ab7c00db268db8369188600a9665708ddd34701840ca1bc1b3c646641b60eda2019d"},"execution_payload":{"parent_hash":"0xca7e7e7fcf3ef35a569c1647d56b11873664e3972d17c5dc339af901230166d5","fee_recipient":"0x8b0c2c4c8eb078bc6c01f48523764c8942c0c6c4","state_root":"0x65ff6f9be55e066f1ed9f5f899752e174c31793034260389316c0ae897483512","receipts_root":"0x1544df33845496bdab8cb97867ec0c6e060ed6690e54c85ae4cb9cc58ddc00dd","logs_bloom":"0x08000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000200000000000000000000000000004000000000000001002000000000000001000000000000000000000000000000020000000100000000000800000000000000000000000000000000080000000000000000000000000000000000000480000000008000000000000000000000001040000000000000000000000000000000000000000000000000000000000000000000000400000000000000004000000001000000000000000020000000000000000000000000000000000000000000000000000000000000000010","prev_randao":"0x3c3397f7c670538c30a11f6c5733e66af09f9a34ab0ef31b0ffa63314b79099f","block_number":"1663387","gas_limit":"30000000","gas_used":"230800","timestamp":"1660027728","extra_data":"0x","base_fee_per_gas":"10","block_hash":"0x8145108c4ba0bd6507019ee9ef1eaa225daa0fd220bfea44f5e1d3b58c313875","transactions":["%#x"]}}},"signature":"0x8b0c109f0148cd7979bc8101f35e909c8b24e08fbfb0a36491270f2d3889c08b71ab83f59f005eff75272627e569f2d91769524dd5790f918955315534e245ad65423fe45f6fb749d9d4cc593c6f56388eef6c5b123b0f7cb526cbdf7fa053c8"}}`, i, proposer, deposits, createTx(txFeeGweiPerBlock))
+		mocks[fmt.Sprintf("/eth/v2/beacon/blocks/%d", i)] = fmt.Sprintf(`{"version":"capella","data":{"message":{"slot":"%d","proposer_index":"%d","parent_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","state_root":"0x3c900df8e277bade69a1c29a93f9442940fc5e43a96c60dfc33d0f0a54a73af6","body":{"randao_reveal":"0x886b31ed2d6caead1e6632dcaec7edb113789f81dbc101160f903ad72c01429203c15ae75e00bd6987ca5ec79750f9c6040a7805284b24f5b3fa8131579c743e592033de069345ccb4b9a99fd73712d8b2276791847282dbfb7634fcb050ae80","eth1_data":{"deposit_root":"0x9df92d765b5aa041fd4bbe8d5878eb89290efa78e444c1a603eecfae2ea05fa4","deposit_count":"403","block_hash":"0x4d0d1732d9a72d2127ab2ad120e66da738cab3369239ec9debd7aea3b89f9812"},"graffiti":"0x0000000000000000000000000000000000000000000000000000000000000000","proposer_slashings":[],"attester_slashings":[],"attestations":[{"aggregation_bits":"0xf7fa6fffbcbbbf6f","data":{"slot":"357843","index":"0","beacon_block_root":"0xae77f6e0db57769b5ec6c16c4ef7489ddd47728d98297833b5a1692afc5072cb","source":{"epoch":"11181","root":"0xa0d0f93cc58e7e0a6b08c600d2a8054dc41fbadd8aba116e6e8cb1a1870321d0"},"target":{"epoch":"11182","root":"0x82cf146d63ea46194fb6ea4e2c99b244aea76cf8c6546ae09a749a0406d78823"}},"signature":"0xad7d675b775c89fb5c1605f1c91bb595e4feb0a2a0440b23aacfbc6d95daa02e761e8ad48a6cf0dd041d65250a97bf1200e879212f389173cdb2c5792d977411aa44f62eb79e71447f00f2eb02c3aacb4fdc4e939a5d7d01a2198ccdb758b641"}],"deposits":%s,"voluntary_exits":[],"sync_aggregate":{"sync_committee_bits":"0xf74edf53ffdb7f7f7db76efef7fcfb6eff7ffeffbff7f7fddf3f57f7d7fff1b7b7fb3e7bffffff5afe7fffff7fcb437fdffee3efd6dff76df766ffffd7fffff1","sync_committee_signature":"0x98fef94f6488bcb1d1c47517e28683d280c36cfd3caa37403e40a72b0500de7ce84f234760edc17a2bd1031db194570d17af1eb253d4d117f88b39e30ee0ab7c00db268db8369188600a9665708ddd34701840ca1bc1b3c646641b60eda2019d"},"execution_payload":{"parent_hash":"0xca7e7e7fcf3ef35a569c1647d56b11873664e3972d17c5dc339af901230166d5","fee_recipient":"0x8b0c2c4c8eb078bc6c01f48523764c8942c0c6c4","state_root":"0x65ff6f9be55e066f1ed9f5f899752e174c31793034260389316c0ae897483512","receipts_root":"0x1544df33845496bdab8cb97867ec0c6e060ed6690e54c85ae4cb9cc58ddc00dd","logs_bloom":"0x08000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000200000000000000000000000000004000000000000001002000000000000001000000000000000000000000000000020000000100000000000800000000000000000000000000000000080000000000000000000000000000000000000480000000008000000000000000000000001040000000000000000000000000000000000000000000000000000000000000000000000400000000000000004000000001000000000000000020000000000000000000000000000000000000000000000000000000000000000010","prev_randao":"0x3c3397f7c670538c30a11f6c5733e66af09f9a34ab0ef31b0ffa63314b79099f","block_number":"1663387","gas_limit":"30000000","gas_used":"230800","timestamp":"1660027728","extra_data":"0x","base_fee_per_gas":"10","block_hash":"0x8145108c4ba0bd6507019ee9ef1eaa225daa0fd220bfea44f5e1d3b58c313875","transactions":["%#x"],"withdrawals":%s},"bls_to_execution_changes":[]}},"signature":"0x8b0c109f0148cd7979bc8101f35e909c8b24e08fbfb0a36491270f2d3889c08b71ab83f59f005eff75272627e569f2d91769524dd5790f918955315534e245ad65423fe45f6fb749d9d4cc593c6f56388eef6c5b123b0f7cb526cbdf7fa053c8"}}`, i, proposer, deposits, createTx(txFeeGweiPerBlock), withdrawals)
 	}
 
 	bnServer := httptest.NewServer(
@@ -208,28 +269,46 @@ func TestEthstore(t *testing.T) {
 	)
 	defer bnServer.Close()
 
+	type elServerReq struct {
+		Jsonrpc string   `json:"jsonrpc"`
+		ID      int      `json:"id"`
+		Method  string   `json:"method"`
+		Params  []string `json:"params"`
+	}
+
 	elServer := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqs := []*elServerReq{}
+			err = json.NewDecoder(r.Body).Decode(&reqs)
+			if err != nil {
+				t.Fatal(err)
+			}
 			effectiveGasPrice := hexutil.EncodeUint64(100)
 			gasUsed := hexutil.EncodeUint64(1e11 + 23080)
-			d := []byte(fmt.Sprintf(`[{ "jsonrpc": "2.0", "result": { "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "blockNumber": "0x712208", "contractAddress": null, "cumulativeGasUsed": "0x1a8c4", "effectiveGasPrice": "%s", "from": "0x9709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "gasUsed": "%s", "logs": [ { "address": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "topics": [ "0x9dbb0e7dda3e09710ce75b801addc87cf9d9c6c581641b3275fca409ad086c62", "0x0000000000000000000000009709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "0x06c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c753" ], "data": "0x00000000000000000000000000000000000000000000000002c68af0bb140000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x0", "removed": false }, { "address": "0xde29d060d45901fb19ed6c6e959eb22d8626708e", "topics": [ "0x7d3450d4f5138e54dcb21a322312d50846ead7856426fb38778f8ef33aeccc01", "0x000000000000000000000000c3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "0x073314940630fd6dcda0d772d4c972c4e0a9946bef9dabf4ef84eda8ef542b82", "0x02d757788a8d8d6f21d1cd40bce38a8222d70654214e96ff95d8086e684fbee5" ], "data": "0x0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000002c0bb000000000000000000000000000000000000000000000000000000000000000306c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c75300000000000000000000000000000000000000000000000002c68af0bb1400000000000000000000000000000000000000000000000000000000000000000000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x1", "removed": false } ], "logsBloom": "0x00000000000000000000000000000000002000000000000000000000000080040000002000000000001000001004000000000000001008100000000000000000000000000000000000000200000000000000000000002000000000040000000000000000020000000000000000000000000000000000000000000000000000000000000000800000000000000000000000001000022000000000000008000000000000000000000000000000000000000000000000200000000000000000000000000000008020000000000004000000000000000080000000000420000000000000000000000080000000000000000000000000000000000000000000000000", "status": "0x1", "to": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "type": "0x2" }, "id": 0 }]`, effectiveGasPrice, gasUsed))
+			res := []string{}
+			for _, req := range reqs {
+				res = append(res, fmt.Sprintf(`{ "jsonrpc": "2.0", "id": %v, "result": { "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "blockNumber": "0x712208", "contractAddress": null, "cumulativeGasUsed": "0x1a8c4", "effectiveGasPrice": "%s", "from": "0x9709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "gasUsed": "%s", "logs": [ { "address": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "topics": [ "0x9dbb0e7dda3e09710ce75b801addc87cf9d9c6c581641b3275fca409ad086c62", "0x0000000000000000000000009709ae4129ed4bb3fa6678e83a9976b7cc81abd1", "0x06c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c753" ], "data": "0x00000000000000000000000000000000000000000000000002c68af0bb140000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x0", "removed": false }, { "address": "0xde29d060d45901fb19ed6c6e959eb22d8626708e", "topics": [ "0x7d3450d4f5138e54dcb21a322312d50846ead7856426fb38778f8ef33aeccc01", "0x000000000000000000000000c3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "0x073314940630fd6dcda0d772d4c972c4e0a9946bef9dabf4ef84eda8ef542b82", "0x02d757788a8d8d6f21d1cd40bce38a8222d70654214e96ff95d8086e684fbee5" ], "data": "0x0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000002c0bb000000000000000000000000000000000000000000000000000000000000000306c20d147026151ea2785419a4070f32ad0f7884d18dd53d68477a58e556c75300000000000000000000000000000000000000000000000002c68af0bb1400000000000000000000000000000000000000000000000000000000000000000000", "blockNumber": "0x712208", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "blockHash": "0xf76daa365606f130e620444e48512cca421318cfebc5b1152a5494c7ef6fe6fc", "logIndex": "0x1", "removed": false } ], "logsBloom": "0x00000000000000000000000000000000002000000000000000000000000080040000002000000000001000001004000000000000001008100000000000000000000000000000000000000200000000000000000000002000000000040000000000000000020000000000000000000000000000000000000000000000000000000000000000800000000000000000000000001000022000000000000008000000000000000000000000000000000000000000000000200000000000000000000000000000008020000000000004000000000000000080000000000420000000000000000000000080000000000000000000000000000000000000000000000000", "status": "0x1", "to": "0xc3511006c04ef1d78af4c8e0e74ec18a6e64ff9e", "transactionHash": "0xa515aea9c1b298c2947454902af1738af230030553943ba5cc738cbabfca9a4e", "transactionIndex": "0x0", "type": "0x2" } }`, req.ID, effectiveGasPrice, gasUsed))
+			}
+			d := []byte("[" + strings.Join(res, ",") + "]")
 			w.Write(d)
 		}),
 	)
 	defer elServer.Close()
 
 	// SetDebugLevel(1)
-	day, _, err := Calculate(context.Background(), bnServer.URL, elServer.URL, "10", 1)
+	day, _, err := Calculate(context.Background(), bnServer.URL, elServer.URL, "10", 1, RECEIPTS_MODE_BATCH)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	t.Logf("%+v", *day)
 
 	extraDepositsWei := decimal.NewFromInt(32e9).Mul(decimal.NewFromInt(1e9))
+	// only validator 6's withdrawal, in the block at endSlot, belongs to day 10
+	withdrawalsWei := decimal.NewFromInt(1000e9).Mul(decimal.NewFromInt(1e9))
 	endWei := decimal.NewFromInt(29 * 320032e5).Mul(decimal.NewFromInt(1e9)).Add(extraDepositsWei)
-	startWei := decimal.NewFromInt(29 * 32e9).Mul(decimal.NewFromInt(1e9))
-	consWei := endWei.Sub(startWei).Sub(extraDepositsWei)
+	startWei := decimal.NewFromInt(29 * 32e9).Mul(decimal.NewFromInt(1e9)).Add(withdrawalsWei)
+	consWei := endWei.Sub(startWei).Sub(extraDepositsWei).Add(withdrawalsWei)
 	execWei := decimal.NewFromInt(29 * 10000 * 225).Mul(decimal.NewFromInt(1e9))
 	eff := decimal.NewFromInt(29 * 32e9).Mul(decimal.NewFromInt(1e9))
 	apr := decimal.NewFromInt(365).Mul(consWei.Add(execWei)).Div(eff)
@@ -255,6 +334,9 @@ func TestEthstore(t *testing.T) {
 	if !day.DepositsSumGwei.Equal(extraDepositsWei.Div(decimal.NewFromInt(1e9))) {
 		t.Errorf("wrong DepositsSumGwei: %v != %v", day.DepositsSumGwei, extraDepositsWei.Div(decimal.NewFromInt(1e9)))
 	}
+	if !day.WithdrawalsSumGwei.Equal(withdrawalsWei.Div(decimal.NewFromInt(1e9))) {
+		t.Errorf("wrong WithdrawalsSumGwei: %v != %v", day.WithdrawalsSumGwei, withdrawalsWei.Div(decimal.NewFromInt(1e9)))
+	}
 	if !day.ConsensusRewardsGwei.Equal(consWei.Div(decimal.NewFromInt(1e9))) {
 		t.Errorf("wrong ConsensusRewardsGwei: %v != %v", day.ConsensusRewardsGwei, 92800000)
 	}
@@ -264,6 +346,12 @@ func TestEthstore(t *testing.T) {
 	if !day.TotalRewardsWei.Equal(consWei.Add(execWei)) {
 		t.Errorf("wrong TotalRewardsWei: %v != %v", day.TotalRewardsWei, consWei.Add(execWei))
 	}
+}
+
+// phase0StateJson is a minimal phase0 state, which is what the validators are
+// read from.
+func phase0StateJson(slot string, validators, balances []byte) string {
+	return fmt.Sprintf(`{ "version": "phase0", "execution_optimistic": false, "finalized": false, "data": { "genesis_time": "1", "genesis_validators_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "slot": "%s", "fork": { "previous_version": "0x00000000", "current_version": "0x00000000", "epoch": "1" }, "latest_block_header": { "slot": "1", "proposer_index": "1", "parent_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "state_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "body_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "block_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "state_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "historical_roots": [ "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" ], "eth1_data": { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "eth1_data_votes": [ { "deposit_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "deposit_count": "1", "block_hash": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } ], "eth1_deposit_index": "1", "validators": %s, "balances":%s, "slashings": [ ], "previous_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "current_epoch_attestations": [ { "aggregation_bits": "0x01", "data": { "slot": "1", "index": "1", "beacon_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "target": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } }, "inclusion_delay": "1", "proposer_index": "1" } ], "justification_bits": "0x01", "previous_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "current_justified_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" }, "finalized_checkpoint": { "epoch": "1", "root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2" } } }`, slot, validators, balances)
 }
 
 func createTx(feeGwei uint64) []byte {
