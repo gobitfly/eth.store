@@ -4,7 +4,7 @@ GITDATE=$$(TZ=UTC git show -s --date=iso-strict-local --format=%cd HEAD | sed 's
 BUILDDATE=`date -u +"%Y%m%d%H%M%S"`
 LDFLAGS="-X ${GITURL}/version.GitCommit=${GITCOMMIT} -X ${GITURL}/version.GitDate=${GITDATE} -X ${GITURL}/version.Version=${GITDATE}-${GITCOMMIT}"
 BINARY=bin/eth.store
-all: test build
+all: build
 test:
 	go test -v ./...
 clean:
