@@ -228,6 +228,65 @@ func GetValidators(ctx context.Context, client *ethHttp.Service, stateID string)
 	return vals.Data, nil
 }
 
+// queuedDeposit is a pending deposit the protocol credits without a deposit
+// request. Both kinds are queued with slot 0: the balance above 32 ETH that switching
+// a validator to compounding moves out of it (queue_excess_active_balance, signed with
+// the G2 point at infinity), and, from Electra on, legacy deposits from the deposit
+// contract. Deposit requests carry the slot of their block and are accounted from
+// the beaconcha.in API when they are credited.
+type queuedDeposit struct {
+	Pubkey    string
+	Amount    phase0.Gwei
+	Signature phase0.BLSSignature
+}
+
+// g2PointAtInfinity is the signature of the pending deposits the protocol creates itself.
+var g2PointAtInfinity = phase0.BLSSignature{0xc0}
+
+func (d queuedDeposit) isExcess() bool {
+	return d.Signature == g2PointAtInfinity
+}
+
+var queuedDepositsCache *lru.Cache
+var queuedDepositsCacheMu = sync.Mutex{}
+
+// getQueuedDeposits returns how often each queuedDeposit is in the pending deposits
+// queue of a state.
+func getQueuedDeposits(ctx context.Context, client *ethHttp.Service, stateID string) (map[queuedDeposit]int, error) {
+	key := fmt.Sprintf("%s:%s", client.Address(), stateID)
+	queuedDepositsCacheMu.Lock()
+	if queuedDepositsCache == nil {
+		c, err := lru.New(2)
+		if err != nil {
+			queuedDepositsCacheMu.Unlock()
+			return nil, err
+		}
+		queuedDepositsCache = c
+	}
+	val, found := queuedDepositsCache.Get(key)
+	queuedDepositsCacheMu.Unlock()
+	if found {
+		return val.(map[queuedDeposit]int), nil
+	}
+
+	res, err := client.PendingDeposits(ctx, &api.PendingDepositsOpts{State: stateID})
+	if err != nil {
+		return nil, fmt.Errorf("error getting pending deposits for state %v: %w", stateID, err)
+	}
+	queued := map[queuedDeposit]int{}
+	for _, d := range res.Data {
+		if d.Slot != 0 {
+			continue
+		}
+		queued[queuedDeposit{Pubkey: d.Pubkey.String(), Amount: d.Amount, Signature: d.Signature}]++
+	}
+
+	queuedDepositsCacheMu.Lock()
+	queuedDepositsCache.Add(key, queued)
+	queuedDepositsCacheMu.Unlock()
+	return queued, nil
+}
+
 type BlockData struct {
 	Version       spec.DataVersion
 	ProposerIndex phase0.ValidatorIndex
@@ -534,6 +593,52 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		// set endBalance of validator to the balance of the first epoch of the next day
 		v.EndBalanceGwei = val.Balance
 	}
+
+	// From Electra on, balance moves through the pending deposits queue without a
+	// deposit request: switching a validator to compounding queues its balance above
+	// 32 ETH, which is credited back weeks later, and a legacy deposit is only queued
+	// when its block includes it. Neither move is a reward, and neither has to change
+	// the effective balance. So excess balance entering the queue is accounted as a
+	// withdrawal, and any of these deposits leaving it as a deposit. Both queues are
+	// read from the states the balances above are read from.
+	if electraForkEpoch <= endEpoch {
+		startQueue := map[queuedDeposit]int{}
+		var endQueue map[queuedDeposit]int
+		queueGroup, queueCtx := errgroup.WithContext(ctx)
+		if electraForkEpoch <= firstEpoch {
+			queueGroup.Go(func() error {
+				var err error
+				startQueue, err = getQueuedDeposits(queueCtx, client, fmt.Sprintf("%d", firstSlot))
+				if err != nil {
+					return fmt.Errorf("error getting queued deposits for firstSlot %d: %w", firstSlot, err)
+				}
+				return nil
+			})
+		}
+		queueGroup.Go(func() error {
+			var err error
+			endQueue, err = getQueuedDeposits(queueCtx, client, fmt.Sprintf("%d", endSlot))
+			if err != nil {
+				return fmt.Errorf("error getting queued deposits for endSlot %d: %w", endSlot, err)
+			}
+			return nil
+		})
+		if err := queueGroup.Wait(); err != nil {
+			return nil, nil, err
+		}
+		for d, n := range startQueue {
+			v, exists := validatorsByPubkey[d.Pubkey]
+			if credited := n - endQueue[d]; exists && credited > 0 {
+				v.DepositsSumGwei += d.Amount * phase0.Gwei(credited)
+			}
+		}
+		for d, n := range endQueue {
+			v, exists := validatorsByPubkey[d.Pubkey]
+			if queued := n - startQueue[d]; exists && queued > 0 && d.isExcess() {
+				v.WithdrawalsSumGwei += d.Amount * phase0.Gwei(queued)
+			}
+		}
+	}
 	if GetDebugLevel() > 0 {
 		log.Printf("DEBUG eth.store: startValidators: %v, endValidators: %v, ethstoreValidators: %v", len(startValidators), len(endValidators), len(validatorsByIndex))
 	}
@@ -713,7 +818,12 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 			validatorsMu.Lock()
 			defer validatorsMu.Unlock()
-			for _, d := range blockData.Deposits {
+			deposits := blockData.Deposits
+			if blockData.Version >= spec.DataVersionElectra {
+				// a deposit is only queued here and is accounted when the queue credits it
+				deposits = nil
+			}
+			for _, d := range deposits {
 				v, exists := validatorsByPubkey[d.Data.PublicKey.String()]
 				if !exists {
 					// only calculate for validators that have been active the whole day
