@@ -132,6 +132,15 @@ type gloasDayScenario struct {
 	pubkeys map[uint64]string
 	// deposits in the body of a fulu block
 	fuluDeposits map[uint64][]map[string]any
+	// deposits the beaconcha.in API reports as credited at the last slot of an epoch
+	apiDeposits map[uint64][]map[string]any
+	// validators that switch to compounding during the day: 0x01 credentials at its
+	// start, 0x02 at its end, where every other validator has 0x00 credentials
+	switched map[uint64]bool
+	// validators with 0x02 credentials all day
+	compounding map[uint64]bool
+	// MIN_ACTIVATION_BALANCE in Gwei; 0 means 32 ETH
+	minActivationBalance uint64
 }
 
 const (
@@ -144,19 +153,24 @@ const (
 	builderFlag          = uint64(1) << 40
 )
 
+// resetCaches empties the caches of Calculate. They are keyed by the node address, and
+// a closed test server's port is reused.
+func resetCaches() {
+	validatorsCacheMu.Lock()
+	validatorsCache = nil
+	validatorsCacheMu.Unlock()
+	queuedExcessCacheMu.Lock()
+	queuedExcessCache = nil
+	queuedExcessCacheMu.Unlock()
+}
+
 // runGloasDay calculates day 10 of a devnet for the scenario. Every block is
 // proposed by validator slot%10, every validator starts the day with 32 ETH and
 // ends it with 32.0032 ETH, and every gloas payload holds one transaction that
 // pays its proposer gloasTestTxFeeWei.
-func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day, stateRequests int32, err error) {
+func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day, validators map[uint64]*Day, stateRequests int32, err error) {
 	t.Helper()
-	// the caches are keyed by the node address, and a closed test server's port is reused
-	validatorsCacheMu.Lock()
-	validatorsCache = nil
-	validatorsCacheMu.Unlock()
-	queuedDepositsCacheMu.Lock()
-	queuedDepositsCache = nil
-	queuedDepositsCacheMu.Unlock()
+	resetCaches()
 	gloasTemplate, err := os.ReadFile("testdata/gloas_block.json")
 	if err != nil {
 		t.Fatal(err)
@@ -206,24 +220,35 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 		return string(out)
 	}
 
+	minActivationBalance := sc.minActivationBalance
+	if minActivationBalance == 0 {
+		minActivationBalance = 32e9
+	}
 	mocks := map[string]string{
 		"/eth/v1/beacon/genesis":           `{"data":{"genesis_time":"1606824023","genesis_validators_root":"0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95","genesis_fork_version":"0x10733183"}}`,
 		"/eth/v1/beacon/headers/finalized": fmt.Sprintf(`{"data":{"root":"0x3aee29bcfa7a9fdf01394a3dce74ae063c89023df71867ad1555f1e494d138ee","canonical":true,"header":{"message":{"slot":"%d","proposer_index":"1","parent_root":"0x4a451b6a4962bcbd619ee1f0b6a7d85dded49f049877de325122e21350e5d6f2","state_root":"0xf12219d8bcdb7ed125da01e4f7aa30754bff2c9fc0bf57dd728c0b02bb847a92","body_root":"0x31f4433e6e260a0fac6e80ad3f9df1998fbbab269408601a6da7a5d32ccbb258"},"signature":"0x8ccb90ff41ec1f82975fb12384f3d44194b27403f1454e878e9c07c9951df33968556e2ce0dfb8ce42e2e0bbac8c80e211d35d01617712292805bc8d9ac2e3429f821953cfc1dbb9d9ea359cd37b39850f4e29c81fc3d67e150985c609d4e826"}}}`, sc.finalizedSlot),
-		"/eth/v1/config/spec":              fmt.Sprintf(`{"data":{"CONFIG_NAME":"devnet","PRESET_BASE":"mainnet","GENESIS_FORK_VERSION":"0x10733183","ELECTRA_FORK_EPOCH":"%d","FULU_FORK_EPOCH":"0","GLOAS_FORK_EPOCH":"%d","SECONDS_PER_SLOT":"12","SLOTS_PER_EPOCH":"32","DOMAIN_DEPOSIT":"0x03000000","DEPOSIT_CHAIN_ID":"7091047534","DEPOSIT_NETWORK_ID":"7091047534","DEPOSIT_CONTRACT_ADDRESS":"0x00000000219ab540356cbb839cbe05303d7705fa"}}`, sc.electraForkSlot/32, sc.forkSlot/32),
+		"/eth/v1/config/spec":              fmt.Sprintf(`{"data":{"CONFIG_NAME":"devnet","PRESET_BASE":"mainnet","GENESIS_FORK_VERSION":"0x10733183","ELECTRA_FORK_EPOCH":"%d","FULU_FORK_EPOCH":"0","GLOAS_FORK_EPOCH":"%d","SECONDS_PER_SLOT":"12","SLOTS_PER_EPOCH":"32","MIN_ACTIVATION_BALANCE":"%d","DOMAIN_DEPOSIT":"0x03000000","DEPOSIT_CHAIN_ID":"7091047534","DEPOSIT_NETWORK_ID":"7091047534","DEPOSIT_CONTRACT_ADDRESS":"0x00000000219ab540356cbb839cbe05303d7705fa"}}`, sc.electraForkSlot/32, sc.forkSlot/32, minActivationBalance),
 		"/eth/v1/config/deposit_contract":  `{"data":{"chain_id":"7091047534","address":"0x00000000219ab540356cbb839cbe05303d7705fa"}}`,
 		"/eth/v1/config/fork_schedule":     `{"data":[{"previous_version":"0x10733183","current_version":"0x10733183","epoch":"0"}]}`,
 		"/eth/v1/node/version":             `{"data":{"version":"Lighthouse/v8.2.2-4b1f3c2/x86_64-linux"}}`,
 		"/eth/v1/node/syncing":             `{"data":{"head_slot":"100000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}`,
 	}
 
-	stateJson := func(slot uint64, balance uint64, balances map[uint64]uint64) string {
+	stateJson := func(slot uint64, balance uint64, balances map[uint64]uint64, switchedPrefix string) string {
 		vals, bals := []string{}, []string{}
 		for i := 0; i < gloasTestValis; i++ {
 			pubkey, exists := sc.pubkeys[uint64(i)]
 			if !exists {
 				pubkey = fmt.Sprintf("%#096x", i)
 			}
-			vals = append(vals, fmt.Sprintf(`{"pubkey":"%s","withdrawal_credentials":"%#064x","effective_balance":"32000000000","slashed":false,"activation_eligibility_epoch":"0","activation_epoch":"0","exit_epoch":"18446744073709551615","withdrawable_epoch":"18446744073709551615"}`, pubkey, i))
+			credentials := fmt.Sprintf("%#064x", i)
+			if sc.switched[uint64(i)] {
+				credentials = switchedPrefix + credentials[4:]
+			}
+			if sc.compounding[uint64(i)] {
+				credentials = "0x02" + credentials[4:]
+			}
+			vals = append(vals, fmt.Sprintf(`{"pubkey":"%s","withdrawal_credentials":"%s","effective_balance":"32000000000","slashed":false,"activation_eligibility_epoch":"0","activation_epoch":"0","exit_epoch":"18446744073709551615","withdrawable_epoch":"18446744073709551615"}`, pubkey, credentials))
 			b, exists := balances[uint64(i)]
 			if !exists {
 				b = balance
@@ -232,8 +257,8 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 		}
 		return phase0StateJson(fmt.Sprintf("%d", slot), []byte("["+strings.Join(vals, ",")+"]"), []byte("["+strings.Join(bals, ",")+"]"))
 	}
-	mocks[fmt.Sprintf("/eth/v2/debug/beacon/states/%d", gloasTestFirstSlot)] = stateJson(gloasTestFirstSlot, 32e9, sc.startBalances)
-	mocks[fmt.Sprintf("/eth/v2/debug/beacon/states/%d", gloasTestEndSlot)] = stateJson(gloasTestEndSlot, 32e9+3200000, sc.endBalances)
+	mocks[fmt.Sprintf("/eth/v2/debug/beacon/states/%d", gloasTestFirstSlot)] = stateJson(gloasTestFirstSlot, 32e9, sc.startBalances, "0x01")
+	mocks[fmt.Sprintf("/eth/v2/debug/beacon/states/%d", gloasTestEndSlot)] = stateJson(gloasTestEndSlot, 32e9+3200000, sc.endBalances, "0x02")
 	queueJson := func(queue []pendingDepositJson) string {
 		if queue == nil {
 			queue = []pendingDepositJson{}
@@ -268,8 +293,21 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 		}
 	}
 	for e := uint64(gloasTestFirstSlot/32 + 1); e <= gloasTestEndSlot/32; e++ {
-		mocks[fmt.Sprintf("/api/v1/slot/%d/deposit_requests", e*32-1)] = `{"status":"OK","data":[]}`
+		deposits := sc.apiDeposits[e*32-1]
+		if deposits == nil {
+			deposits = []map[string]any{}
+		}
+		out, err := json.Marshal(map[string]any{"status": "OK", "data": deposits})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mocks[fmt.Sprintf("/api/v1/slot/%d/deposit_requests", e*32-1)] = string(out)
 		mocks[fmt.Sprintf("/api/v1/slot/%d/consolidation_requests", e*32-1)] = `{"status":"OK","data":[]}`
+	}
+	for slot := range sc.apiDeposits {
+		if _, served := mocks[fmt.Sprintf("/api/v1/slot/%d/deposit_requests", slot)]; !served {
+			t.Fatalf("apiDeposits at slot %d, which the day doesn't ask the API for", slot)
+		}
 	}
 
 	var states atomic.Int32
@@ -347,8 +385,8 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 	SetBeaconchainApiBaseUrl(bnServer.URL)
 	defer SetBeaconchainApiBaseUrl("")
 
-	day, _, err = Calculate(context.Background(), bnServer.URL, elServer.URL, fmt.Sprintf("%d", gloasTestDay), 8, receiptsMode)
-	return day, states.Load(), err
+	day, validators, err = Calculate(context.Background(), bnServer.URL, elServer.URL, fmt.Sprintf("%d", gloasTestDay), 8, receiptsMode)
+	return day, validators, states.Load(), err
 }
 
 func TestEthstoreGloas(t *testing.T) {
@@ -482,7 +520,7 @@ type gloasDayCase struct {
 }
 
 func testGloasDay(t *testing.T, tt gloasDayCase, receiptsMode int) {
-	res, stateRequests, err := runGloasDay(t, tt.scenario, receiptsMode)
+	res, _, stateRequests, err := runGloasDay(t, tt.scenario, receiptsMode)
 	if tt.wantNotFinalized {
 		if !errors.Is(err, ErrPayloadsNotFinalized) {
 			t.Fatalf("got error %v, want ErrPayloadsNotFinalized", err)

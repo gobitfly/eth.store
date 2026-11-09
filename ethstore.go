@@ -29,9 +29,6 @@ import (
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	gethRPC "github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
-	"github.com/prysmaticlabs/prysm/v5/beacon-chain/core/signing"
-	"github.com/prysmaticlabs/prysm/v5/contracts/deposit"
-	ethpb "github.com/prysmaticlabs/prysm/v5/proto/prysm/v1alpha1"
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
@@ -74,6 +71,13 @@ type Validator struct {
 	DepositsSumGwei      phase0.Gwei
 	WithdrawalsSumGwei   phase0.Gwei
 	TxFeesSumWei         *big.Int
+
+	// mayQueueExcess is set when the protocol may have queued the validator's excess
+	// during the day: it switched to compounding, or the Electra fork queued it.
+	mayQueueExcess bool
+	// creditedGwei sums the deposits the beaconcha.in API reports as credited to the
+	// validator during the day, except those signed with the point at infinity.
+	creditedGwei phase0.Gwei
 }
 
 func SetDebugLevel(lvl uint64) {
@@ -228,62 +232,100 @@ func GetValidators(ctx context.Context, client *ethHttp.Service, stateID string)
 	return vals.Data, nil
 }
 
-// queuedDeposit is a pending deposit the protocol credits without a deposit
-// request. Both kinds are queued with slot 0: the balance above 32 ETH that switching
-// a validator to compounding moves out of it (queue_excess_active_balance, signed with
-// the G2 point at infinity), and, from Electra on, legacy deposits from the deposit
-// contract. Deposit requests carry the slot of their block and are accounted from
-// the beaconcha.in API when they are credited.
-type queuedDeposit struct {
-	Pubkey    string
-	Amount    phase0.Gwei
-	Signature phase0.BLSSignature
+// depositKey identifies a pending deposit of the same amount to the same validator.
+type depositKey struct {
+	Pubkey string
+	Amount phase0.Gwei
 }
 
-// g2PointAtInfinity is the signature of the pending deposits the protocol creates itself.
-var g2PointAtInfinity = phase0.BLSSignature{0xc0}
+// compoundingPrefix is the first byte of compounding withdrawal credentials.
+const compoundingPrefix = 0x02
 
-func (d queuedDeposit) isExcess() bool {
-	return d.Signature == g2PointAtInfinity
+// isInfinitySignature reports whether a signature as the beaconcha.in API writes it
+// is the G2 point at infinity.
+func isInfinitySignature(signature string) bool {
+	b, err := hexutil.Decode(signature)
+	return err == nil && len(b) == phase0.SignatureLength && phase0.BLSSignature(b).IsInfinity()
 }
 
-var queuedDepositsCache *lru.Cache
-var queuedDepositsCacheMu = sync.Mutex{}
+// excessDistance is how far amount is from the excess a switch to compounding during
+// the day could have queued: v's balance above the minimum activation balance at the
+// start of the day, or that plus the deposits credited to it that day, since the
+// switch may come after them. Rewards and withdrawals before the switch move it too.
+func excessDistance(v *Validator, amount, minActivationBalance phase0.Gwei) phase0.Gwei {
+	return min(
+		gweiDistance(amount, gweiAbove(v.StartBalanceGwei, minActivationBalance)),
+		gweiDistance(amount, gweiAbove(v.StartBalanceGwei+v.creditedGwei, minActivationBalance)),
+	)
+}
 
-// getQueuedDeposits returns how often each queuedDeposit is in the pending deposits
-// queue of a state.
-func getQueuedDeposits(ctx context.Context, client *ethHttp.Service, stateID string) (map[queuedDeposit]int, error) {
+func gweiAbove(balance, floor phase0.Gwei) phase0.Gwei {
+	if balance > floor {
+		return balance - floor
+	}
+	return 0
+}
+
+func gweiDistance(a, b phase0.Gwei) phase0.Gwei {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+// creditEpochs returns the epochs whose transitions lie between the states at firstSlot
+// and endSlot. The beaconcha.in API reports the deposits and consolidations an epoch
+// transition credits at the last slot of the epoch it ends, epoch*slotsPerEpoch-1.
+func creditEpochs(firstSlot, endSlot, slotsPerEpoch uint64) []uint64 {
+	epochs := []uint64{}
+	for epoch := firstSlot/slotsPerEpoch + 1; epoch*slotsPerEpoch <= endSlot; epoch++ {
+		epochs = append(epochs, epoch)
+	}
+	return epochs
+}
+
+var queuedExcessCache *lru.Cache
+var queuedExcessCacheMu = sync.Mutex{}
+
+// getQueuedExcess returns how often each excess is in the pending deposits queue of a
+// state. The protocol queues a validator's balance above 32 ETH when it switches to
+// compounding, and the Electra fork queued that of validators that already had
+// compounding credentials (queue_excess_active_balance), with slot 0 and the G2 point
+// at infinity as signature. A legacy deposit is queued with slot 0 too, and a deposit
+// request with the slot of its block, both with whatever signature their sender chose,
+// the point at infinity included.
+func getQueuedExcess(ctx context.Context, client *ethHttp.Service, stateID string) (map[depositKey]int, error) {
 	key := fmt.Sprintf("%s:%s", client.Address(), stateID)
-	queuedDepositsCacheMu.Lock()
-	if queuedDepositsCache == nil {
+	queuedExcessCacheMu.Lock()
+	if queuedExcessCache == nil {
 		c, err := lru.New(2)
 		if err != nil {
-			queuedDepositsCacheMu.Unlock()
+			queuedExcessCacheMu.Unlock()
 			return nil, err
 		}
-		queuedDepositsCache = c
+		queuedExcessCache = c
 	}
-	val, found := queuedDepositsCache.Get(key)
-	queuedDepositsCacheMu.Unlock()
+	val, found := queuedExcessCache.Get(key)
+	queuedExcessCacheMu.Unlock()
 	if found {
-		return val.(map[queuedDeposit]int), nil
+		return val.(map[depositKey]int), nil
 	}
 
 	res, err := client.PendingDeposits(ctx, &api.PendingDepositsOpts{State: stateID})
 	if err != nil {
 		return nil, fmt.Errorf("error getting pending deposits for state %v: %w", stateID, err)
 	}
-	queued := map[queuedDeposit]int{}
+	queued := map[depositKey]int{}
 	for _, d := range res.Data {
-		if d.Slot != 0 {
+		if d.Slot != 0 || !d.Signature.IsInfinity() {
 			continue
 		}
-		queued[queuedDeposit{Pubkey: d.Pubkey.String(), Amount: d.Amount, Signature: d.Signature}]++
+		queued[depositKey{Pubkey: d.Pubkey.String(), Amount: d.Amount}]++
 	}
 
-	queuedDepositsCacheMu.Lock()
-	queuedDepositsCache.Add(key, queued)
-	queuedDepositsCacheMu.Unlock()
+	queuedExcessCacheMu.Lock()
+	queuedExcessCache.Add(key, queued)
+	queuedExcessCacheMu.Unlock()
 	return queued, nil
 }
 
@@ -456,19 +498,17 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		}
 	}
 
-	domainDepositIf, exists := apiSpec.Data["DOMAIN_DEPOSIT"]
-	if !exists {
-		return nil, nil, fmt.Errorf("undefined DOMAIN_DEPOSIT in spec")
-	}
-	domainDeposit, ok := domainDepositIf.(phase0.DomainType)
-	if !ok {
-		return nil, nil, fmt.Errorf("invalid format of DOMAIN_DEPOSIT in spec")
-	}
-
-	genesisValidatorsRoot := [32]byte{}
-	depositDomainComputed, err := signing.ComputeDomain(domainDeposit, genesisForkVersion[:], genesisValidatorsRoot[:])
-	if err != nil {
-		return nil, nil, err
+	// what a validator keeps when its excess is queued; specs before Electra lack it,
+	// and it only tunes how a same-day round trip of excess is recognised
+	minActivationBalance := phase0.Gwei(32_000_000_000)
+	switch b := apiSpec.Data["MIN_ACTIVATION_BALANCE"].(type) {
+	case uint64:
+		minActivationBalance = phase0.Gwei(b)
+	case phase0.Gwei:
+		minActivationBalance = b
+	case nil:
+	default:
+		log.Printf("WARN eth.store: unexpected type %T of MIN_ACTIVATION_BALANCE in spec, using %v", b, minActivationBalance)
 	}
 
 	slotsPerEpochIf, exists := apiSpec.Data["SLOTS_PER_EPOCH"]
@@ -548,6 +588,38 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	validatorsByPubkey := map[string]*Validator{}
 	validatorsMu := sync.Mutex{}
 
+	// From Electra on, switching a validator to compounding moves its balance above
+	// 32 ETH into the pending deposits queue, which credits it back later: weeks later
+	// on mainnet, often the same day on a testnet with a short queue. Neither move is a
+	// reward, and neither has to change the effective balance. The excess is accounted
+	// from the queues of the two states the balances are read from: entering the queue
+	// during the day as a withdrawal, leaving it as a deposit.
+	var startExcess, endExcess map[depositKey]int
+	queueCtx, cancelQueue := context.WithCancel(ctx)
+	defer cancelQueue()
+	queueGroup, queueCtx := errgroup.WithContext(queueCtx)
+	if electraForkEpoch <= endEpoch {
+		if electraForkEpoch <= firstEpoch {
+			queueGroup.Go(func() error {
+				var err error
+				startExcess, err = getQueuedExcess(queueCtx, client, fmt.Sprintf("%d", firstSlot))
+				if err != nil {
+					return fmt.Errorf("error getting queued excess for firstSlot %d: %w", firstSlot, err)
+				}
+				return nil
+			})
+		}
+		queueGroup.Go(func() error {
+			var err error
+			endExcess, err = getQueuedExcess(queueCtx, client, fmt.Sprintf("%d", endSlot))
+			if err != nil {
+				return fmt.Errorf("error getting queued excess for endSlot %d: %w", endSlot, err)
+			}
+			return nil
+		})
+	}
+	electraForkDuringDay := firstEpoch < electraForkEpoch && electraForkEpoch <= endEpoch
+
 	startValidators, err := GetValidators(ctx, client, fmt.Sprintf("%d", firstSlot))
 	if err != nil {
 		return nil, nil, fmt.Errorf("error getting startValidators for firstSlot %d: %w", firstSlot, err)
@@ -592,53 +664,35 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		}
 		// set endBalance of validator to the balance of the first epoch of the next day
 		v.EndBalanceGwei = val.Balance
+		compounding := val.Validator.WithdrawalCredentials[0] == compoundingPrefix
+		wasCompounding := startValidators[val.Index].Validator.WithdrawalCredentials[0] == compoundingPrefix
+		v.mayQueueExcess = compounding && (!wasCompounding || electraForkDuringDay)
 	}
 
-	// From Electra on, balance moves through the pending deposits queue without a
-	// deposit request: switching a validator to compounding queues its balance above
-	// 32 ETH, which is credited back weeks later, and a legacy deposit is only queued
-	// when its block includes it. Neither move is a reward, and neither has to change
-	// the effective balance. So excess balance entering the queue is accounted as a
-	// withdrawal, and any of these deposits leaving it as a deposit. Both queues are
-	// read from the states the balances above are read from.
-	if electraForkEpoch <= endEpoch {
-		startQueue := map[queuedDeposit]int{}
-		var endQueue map[queuedDeposit]int
-		queueGroup, queueCtx := errgroup.WithContext(ctx)
-		if electraForkEpoch <= firstEpoch {
-			queueGroup.Go(func() error {
-				var err error
-				startQueue, err = getQueuedDeposits(queueCtx, client, fmt.Sprintf("%d", firstSlot))
-				if err != nil {
-					return fmt.Errorf("error getting queued deposits for firstSlot %d: %w", firstSlot, err)
-				}
-				return nil
-			})
-		}
-		queueGroup.Go(func() error {
-			var err error
-			endQueue, err = getQueuedDeposits(queueCtx, client, fmt.Sprintf("%d", endSlot))
-			if err != nil {
-				return fmt.Errorf("error getting queued deposits for endSlot %d: %w", endSlot, err)
-			}
-			return nil
-		})
-		if err := queueGroup.Wait(); err != nil {
-			return nil, nil, err
-		}
-		for d, n := range startQueue {
-			v, exists := validatorsByPubkey[d.Pubkey]
-			if credited := n - endQueue[d]; exists && credited > 0 {
-				v.DepositsSumGwei += d.Amount * phase0.Gwei(credited)
-			}
-		}
-		for d, n := range endQueue {
-			v, exists := validatorsByPubkey[d.Pubkey]
-			if queued := n - startQueue[d]; exists && queued > 0 && d.isExcess() {
-				v.WithdrawalsSumGwei += d.Amount * phase0.Gwei(queued)
-			}
+	if err := queueGroup.Wait(); err != nil {
+		return nil, nil, err
+	}
+	// Excess only enters the queue through a switch to compounding or the Electra fork.
+	// A legacy deposit signed with the point at infinity looks the same in the queue,
+	// but doesn't move its validator's balance until the queue credits it.
+	excessStillQueued := map[*Validator]bool{}
+	for d, n := range endExcess {
+		v, exists := validatorsByPubkey[d.Pubkey]
+		if queued := n - startExcess[d]; exists && queued > 0 && v.mayQueueExcess {
+			v.WithdrawalsSumGwei += d.Amount * phase0.Gwei(queued)
+			excessStillQueued[v] = true
 		}
 	}
+	for d, n := range startExcess {
+		v, exists := validatorsByPubkey[d.Pubkey]
+		if credited := n - endExcess[d]; exists && credited > 0 {
+			v.DepositsSumGwei += d.Amount * phase0.Gwei(credited)
+		}
+	}
+	// The beaconcha.in API reports the queue's credits of excess too, signed with the
+	// point at infinity like any deposit whose sender chose that signature. Those are
+	// set aside here and told apart once all API calls are done.
+	creditedInfinity := map[depositKey]int{}
 	if GetDebugLevel() > 0 {
 		log.Printf("DEBUG eth.store: startValidators: %v, endValidators: %v, ethstoreValidators: %v", len(startValidators), len(endValidators), len(validatorsByIndex))
 	}
@@ -658,11 +712,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			beaconchainApiGroup := new(errgroup.Group)
 			beaconchainApiGroup.SetLimit(10)
 
-			for i := firstEpoch + 1; i <= lastEpoch+1; i++ {
-				i := i
-				if i == 0 {
-					continue
-				}
+			for _, i := range creditEpochs(firstSlot, endSlot, slotsPerEpoch) {
 				beaconchainApiGroup.Go(func() error {
 					var err error
 					depositRequests, err := beaconchainApiClient.DepositRequests(ctx, beaconchainApiNetworkName, i*slotsPerEpoch-1)
@@ -678,10 +728,16 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 					defer validatorsMu.Unlock()
 					for _, d := range depositRequests.Data {
 						v, exists := validatorsByPubkey[d.Pubkey]
-						if exists {
+						if !exists {
 							// only calculate for validators that have been active the whole day
-							v.DepositsSumGwei += phase0.Gwei(d.Amount)
+							continue
 						}
+						if isInfinitySignature(d.Signature) {
+							creditedInfinity[depositKey{Pubkey: d.Pubkey, Amount: phase0.Gwei(d.Amount)}]++
+							continue
+						}
+						v.DepositsSumGwei += phase0.Gwei(d.Amount)
+						v.creditedGwei += phase0.Gwei(d.Amount)
 					}
 					return nil
 				})
@@ -829,19 +885,8 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 					// only calculate for validators that have been active the whole day
 					continue
 				}
-				msg := &ethpb.Deposit_Data{
-					PublicKey:             d.Data.PublicKey[:],
-					WithdrawalCredentials: d.Data.WithdrawalCredentials,
-					Amount:                uint64(d.Data.Amount),
-					Signature:             d.Data.Signature[:],
-				}
-				err := deposit.VerifyDepositSignature(msg, depositDomainComputed)
-				if err != nil {
-					if GetDebugLevel() > 0 {
-						log.Printf("DEBUG eth.store: invalid deposit signature in block %d: %v", i, err)
-					}
-					continue
-				}
+				// a deposit to an existing validator is a top-up, which the protocol
+				// credits without checking its signature
 				if GetDebugLevel() > 0 {
 					log.Printf("DEBUG eth.store: extra deposit at block %d from %v: %#x: %v\n", i, v.Index, d.Data.PublicKey, d.Data.Amount)
 				}
@@ -862,6 +907,40 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 
 	if err := g.Wait(); err != nil {
 		return nil, nil, err
+	}
+
+	// An infinity-signed credit beyond the excess the queue credited is a top-up from a
+	// sender who signed with the point at infinity, except for one: the excess of a
+	// validator that may have queued it today and no longer has it queued at the end
+	// of the day was credited back the same day, which leaves its balance unchanged.
+	// That is the credit closest to the excess it could have queued (see excessDistance),
+	// within 1/128 of the minimum activation balance (0.25 ETH): enough for the rewards
+	// and the partial withdrawals before the switch, too little for a top-up to pass.
+	roundTripTolerance := minActivationBalance / 128
+	roundTrips := map[*Validator]depositKey{}
+	for d, n := range creditedInfinity {
+		v := validatorsByPubkey[d.Pubkey]
+		topUps := n - max(startExcess[d]-endExcess[d], 0)
+		if topUps <= 0 {
+			continue
+		}
+		v.DepositsSumGwei += d.Amount * phase0.Gwei(topUps)
+		distance := excessDistance(v, d.Amount, minActivationBalance)
+		if !v.mayQueueExcess || excessStillQueued[v] || v.StartBalanceGwei+v.creditedGwei <= minActivationBalance || distance > roundTripTolerance {
+			continue
+		}
+		prev, exists := roundTrips[v]
+		if !exists {
+			roundTrips[v] = d
+			continue
+		}
+		// the smaller amount on a tie, so that every run picks the same credit
+		if prevDistance := excessDistance(v, prev.Amount, minActivationBalance); distance < prevDistance || distance == prevDistance && d.Amount < prev.Amount {
+			roundTrips[v] = d
+		}
+	}
+	for v, d := range roundTrips {
+		v.DepositsSumGwei -= d.Amount
 	}
 
 	if hasGloas {
