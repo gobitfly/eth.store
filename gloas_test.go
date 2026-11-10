@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -132,6 +134,9 @@ type gloasDayScenario struct {
 	pubkeys map[uint64]string
 	// deposits in the body of a fulu block
 	fuluDeposits map[uint64][]map[string]any
+	// deposit requests the block at a slot appends to the queue: those of its payload
+	// in a fulu block, those of its parent's payload in a gloas block
+	depositRequests map[uint64][]map[string]any
 	// deposits the beaconcha.in API reports as credited at the last slot of an epoch
 	apiDeposits map[uint64][]map[string]any
 	// validators that switch to compounding during the day: 0x01 credentials at its
@@ -141,6 +146,17 @@ type gloasDayScenario struct {
 	compounding map[uint64]bool
 	// MIN_ACTIVATION_BALANCE in Gwei; 0 means 32 ETH
 	minActivationBalance uint64
+	// the pending consolidations queue of the states at firstSlot and endSlot
+	startConsolidations []consolidationKey
+	endConsolidations   []consolidationKey
+	// consolidations the beaconcha.in API reports as processed at the last slot of an epoch
+	apiConsolidations map[uint64][]map[string]any
+	// validators that are slashed at the end of the day
+	slashed map[uint64]bool
+	// validators that exit during the day
+	exited map[uint64]bool
+	// counts the requests for blocks, if set
+	blockRequests *atomic.Int32
 }
 
 const (
@@ -159,9 +175,9 @@ func resetCaches() {
 	validatorsCacheMu.Lock()
 	validatorsCache = nil
 	validatorsCacheMu.Unlock()
-	queuedExcessCacheMu.Lock()
-	queuedExcessCache = nil
-	queuedExcessCacheMu.Unlock()
+	pendingQueuesCacheMu.Lock()
+	pendingQueuesCache = nil
+	pendingQueuesCacheMu.Unlock()
 }
 
 // runGloasDay calculates day 10 of a devnet for the scenario. Every block is
@@ -206,12 +222,18 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 			if deposits := sc.fuluDeposits[slot]; len(deposits) > 0 {
 				body["deposits"] = deposits
 			}
+			if requests := sc.depositRequests[slot]; len(requests) > 0 {
+				body["execution_requests"].(map[string]any)["deposits"] = requests
+			}
 		} else {
 			bid := body["signed_execution_payload_bid"].(map[string]any)["message"].(map[string]any)
 			bid["slot"] = fmt.Sprintf("%d", slot)
 			bid["block_hash"] = fmt.Sprintf("%#x", testHash(slot))
 			bid["parent_block_hash"] = fmt.Sprintf("%#x", parentBlockHash)
 			bid["parent_block_root"] = fmt.Sprintf("%#x", testHash(parentSlot))
+			if requests := sc.depositRequests[slot]; len(requests) > 0 {
+				body["parent_execution_requests"].(map[string]any)["deposits"] = requests
+			}
 		}
 		out, err := json.Marshal(b)
 		if err != nil {
@@ -234,6 +256,12 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 		"/eth/v1/node/syncing":             `{"data":{"head_slot":"100000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}`,
 	}
 
+	exitEpoch := func(slot, i uint64) uint64 {
+		if slot == gloasTestEndSlot && sc.exited[i] {
+			return gloasTestEndSlot/32 - 1
+		}
+		return math.MaxUint64
+	}
 	stateJson := func(slot uint64, balance uint64, balances map[uint64]uint64, switchedPrefix string) string {
 		vals, bals := []string{}, []string{}
 		for i := 0; i < gloasTestValis; i++ {
@@ -248,7 +276,7 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 			if sc.compounding[uint64(i)] {
 				credentials = "0x02" + credentials[4:]
 			}
-			vals = append(vals, fmt.Sprintf(`{"pubkey":"%s","withdrawal_credentials":"%s","effective_balance":"32000000000","slashed":false,"activation_eligibility_epoch":"0","activation_epoch":"0","exit_epoch":"18446744073709551615","withdrawable_epoch":"18446744073709551615"}`, pubkey, credentials))
+			vals = append(vals, fmt.Sprintf(`{"pubkey":"%s","withdrawal_credentials":"%s","effective_balance":"32000000000","slashed":%t,"activation_eligibility_epoch":"0","activation_epoch":"0","exit_epoch":"%d","withdrawable_epoch":"18446744073709551615"}`, pubkey, credentials, slot == gloasTestEndSlot && sc.slashed[uint64(i)], exitEpoch(slot, uint64(i))))
 			b, exists := balances[uint64(i)]
 			if !exists {
 				b = balance
@@ -269,10 +297,23 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 		}
 		return fmt.Sprintf(`{"version":"fulu","execution_optimistic":false,"finalized":true,"data":%s}`, out)
 	}
+	consolidationsJson := func(queue []consolidationKey) string {
+		out := []map[string]string{}
+		for _, c := range queue {
+			out = append(out, map[string]string{"source_index": fmt.Sprintf("%d", c.Source), "target_index": fmt.Sprintf("%d", c.Target)})
+		}
+		b, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprintf(`{"version":"fulu","execution_optimistic":false,"finalized":true,"data":%s}`, b)
+	}
 	if sc.electraForkSlot <= gloasTestFirstSlot {
 		mocks[fmt.Sprintf("/eth/v1/beacon/states/%d/pending_deposits", gloasTestFirstSlot)] = queueJson(sc.startQueue)
+		mocks[fmt.Sprintf("/eth/v1/beacon/states/%d/pending_consolidations", gloasTestFirstSlot)] = consolidationsJson(sc.startConsolidations)
 	}
 	mocks[fmt.Sprintf("/eth/v1/beacon/states/%d/pending_deposits", gloasTestEndSlot)] = queueJson(sc.endQueue)
+	mocks[fmt.Sprintf("/eth/v1/beacon/states/%d/pending_consolidations", gloasTestEndSlot)] = consolidationsJson(sc.endConsolidations)
 
 	// the block before the day is FULL, and blocks are also served by root for the lookback
 	parentSlot := uint64(gloasTestFirstSlot - 1)
@@ -292,21 +333,17 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 			latest = testHash(s)
 		}
 	}
+	// the beaconcha.in API's rows of a slot, served a page at a time like the API does
+	apiRows := map[string][]map[string]any{}
 	for e := uint64(gloasTestFirstSlot/32 + 1); e <= gloasTestEndSlot/32; e++ {
-		deposits := sc.apiDeposits[e*32-1]
-		if deposits == nil {
-			deposits = []map[string]any{}
-		}
-		out, err := json.Marshal(map[string]any{"status": "OK", "data": deposits})
-		if err != nil {
-			t.Fatal(err)
-		}
-		mocks[fmt.Sprintf("/api/v1/slot/%d/deposit_requests", e*32-1)] = string(out)
-		mocks[fmt.Sprintf("/api/v1/slot/%d/consolidation_requests", e*32-1)] = `{"status":"OK","data":[]}`
+		apiRows[fmt.Sprintf("/api/v1/slot/%d/deposit_requests", e*32-1)] = sc.apiDeposits[e*32-1]
+		apiRows[fmt.Sprintf("/api/v1/slot/%d/consolidation_requests", e*32-1)] = sc.apiConsolidations[e*32-1]
 	}
-	for slot := range sc.apiDeposits {
-		if _, served := mocks[fmt.Sprintf("/api/v1/slot/%d/deposit_requests", slot)]; !served {
-			t.Fatalf("apiDeposits at slot %d, which the day doesn't ask the API for", slot)
+	for _, rows := range []map[uint64][]map[string]any{sc.apiDeposits, sc.apiConsolidations} {
+		for slot := range rows {
+			if _, served := apiRows[fmt.Sprintf("/api/v1/slot/%d/deposit_requests", slot)]; !served {
+				t.Fatalf("api rows at slot %d, which the day doesn't ask the API for", slot)
+			}
 		}
 	}
 
@@ -314,6 +351,25 @@ func runGloasDay(t *testing.T, sc gloasDayScenario, receiptsMode int) (day *Day,
 	bnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/eth/v2/debug/beacon/states/") {
 			states.Add(1)
+		}
+		if strings.HasPrefix(r.URL.Path, "/eth/v2/beacon/blocks/") && sc.blockRequests != nil {
+			sc.blockRequests.Add(1)
+		}
+		w.Header().Set("ratelimit-limit", "100000")
+		if rows, exists := apiRows[r.URL.Path]; exists {
+			// like the API, which returns up to 100+offset rows from the offset
+			offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+			page := []map[string]any{}
+			if offset < len(rows) {
+				page = rows[offset:min(offset+beaconchainApiPageSize+offset, len(rows))]
+			}
+			out, err := json.Marshal(map[string]any{"status": "OK", "data": page})
+			if err != nil {
+				t.Error(err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(out)
+			return
 		}
 		mock, exists := mocks[r.URL.Path]
 		if !exists {
