@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/attestantio/go-eth2-client/spec/electra"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -45,6 +47,27 @@ var consTimeout = time.Second * 120
 var consTimeoutMu = sync.Mutex{}
 var validatorsCache *lru.Cache
 var validatorsCacheMu = sync.Mutex{}
+
+// ErrCreditsNotIndexed means the beaconcha.in API doesn't report a consolidation the
+// day's queues show, usually because its indexer hasn't processed that epoch yet: retry
+// later, or see SetUnreportedConsolidationsFromState if it never will. A deposit it
+// doesn't report is credited from the queues and the day's blocks instead.
+var ErrCreditsNotIndexed = errors.New("the beaconcha.in API doesn't report all consolidations of the day yet")
+
+var unreportedConsolidationsFromState atomic.Bool
+
+// SetUnreportedConsolidationsFromState makes Calculate account a consolidation the
+// beaconcha.in API doesn't report with the source's balance at the start of the day,
+// capped at its effective balance, instead of returning ErrCreditsNotIndexed. That is
+// what the protocol moves unless the source's balance was below its effective balance
+// and changed before the consolidation, which only sync committee duties do to an
+// exited validator. It is meant for a day the API will never report completely.
+func SetUnreportedConsolidationsFromState(fromState bool) {
+	unreportedConsolidationsFromState.Store(fromState)
+}
+
+// ErrNoFinalizedDay means the chain has not finalized a whole day yet.
+var ErrNoFinalizedDay = errors.New("no day is finalized yet")
 
 type Day struct {
 	Day                  decimal.Decimal `json:"day"`
@@ -173,8 +196,16 @@ func GetFinalizedDay(ctx context.Context, address string) (uint64, error) {
 		return 0, fmt.Errorf("error calling client.BeaconBlockHeader: %w", err)
 	}
 
-	day := uint64(h.Data.Header.Message.Slot)/slotsPerDay - 1
-	return day, nil
+	return lastFinalizedDay(uint64(h.Data.Header.Message.Slot), slotsPerDay)
+}
+
+// lastFinalizedDay returns the last day whose end the finalized slot has reached: the
+// day before the one the finalized slot is in.
+func lastFinalizedDay(finalizedSlot, slotsPerDay uint64) (uint64, error) {
+	if finalizedSlot < slotsPerDay {
+		return 0, fmt.Errorf("%w: finalized slot %v is in day 0", ErrNoFinalizedDay, finalizedSlot)
+	}
+	return finalizedSlot/slotsPerDay - 1, nil
 }
 
 func GetHeadDay(ctx context.Context, address string) (uint64, error) {
@@ -249,13 +280,13 @@ func isInfinitySignature(signature string) bool {
 }
 
 // excessDistance is how far amount is from the excess a switch to compounding during
-// the day could have queued: v's balance above the minimum activation balance at the
-// start of the day, or that plus the deposits credited to it that day, since the
-// switch may come after them. Rewards and withdrawals before the switch move it too.
-func excessDistance(v *Validator, amount, minActivationBalance phase0.Gwei) phase0.Gwei {
+// the day could have queued: the balance above the minimum activation balance at the
+// start of the day, or that plus the other deposits credited that day, since the switch
+// may come after them. Rewards and withdrawals before the switch move it too.
+func excessDistance(startBalance, credited, amount, minActivationBalance phase0.Gwei) phase0.Gwei {
 	return min(
-		gweiDistance(amount, gweiAbove(v.StartBalanceGwei, minActivationBalance)),
-		gweiDistance(amount, gweiAbove(v.StartBalanceGwei+v.creditedGwei, minActivationBalance)),
+		gweiDistance(amount, gweiAbove(startBalance, minActivationBalance)),
+		gweiDistance(amount, gweiAbove(startBalance+credited, minActivationBalance)),
 	)
 }
 
@@ -284,49 +315,129 @@ func creditEpochs(firstSlot, endSlot, slotsPerEpoch uint64) []uint64 {
 	return epochs
 }
 
-var queuedExcessCache *lru.Cache
-var queuedExcessCacheMu = sync.Mutex{}
+// consolidationKey identifies a pending consolidation of a source into a target.
+type consolidationKey struct {
+	Source, Target phase0.ValidatorIndex
+}
 
-// getQueuedExcess returns how often each excess is in the pending deposits queue of a
-// state. The protocol queues a validator's balance above 32 ETH when it switches to
-// compounding, and the Electra fork queued that of validators that already had
-// compounding credentials (queue_excess_active_balance), with slot 0 and the G2 point
-// at infinity as signature. A legacy deposit is queued with slot 0 too, and a deposit
-// request with the slot of its block, both with whatever signature their sender chose,
-// the point at infinity included.
-func getQueuedExcess(ctx context.Context, client *ethHttp.Service, stateID string) (map[depositKey]int, error) {
+// pendingQueues holds how often each entry is in the pending deposits and the pending
+// consolidations queue of a state.
+type pendingQueues struct {
+	// excess is what the protocol queued itself. It queues a validator's balance above
+	// 32 ETH when it switches to compounding, and the Electra fork queued that of
+	// validators that already had compounding credentials (queue_excess_active_balance),
+	// with slot 0 and the G2 point at infinity as signature. A legacy deposit is queued
+	// with slot 0 too, and a deposit request with the slot of its block, both with
+	// whatever signature their sender chose, the point at infinity included.
+	excess map[depositKey]int
+	// deposits is every pending deposit, the excess included.
+	deposits map[depositKey]int
+	// infinityRequests is every deposit request signed with the point at infinity: a
+	// top-up from a sender, which the protocol never queues with a slot other than 0.
+	infinityRequests map[depositKey]int
+	// consolidations is every pending consolidation.
+	consolidations map[consolidationKey]int
+}
+
+var pendingQueuesCache *lru.Cache
+var pendingQueuesCacheMu = sync.Mutex{}
+
+// getPendingQueues returns the pending deposits and consolidations of a state.
+func getPendingQueues(ctx context.Context, client *ethHttp.Service, stateID string) (*pendingQueues, error) {
 	key := fmt.Sprintf("%s:%s", client.Address(), stateID)
-	queuedExcessCacheMu.Lock()
-	if queuedExcessCache == nil {
+	pendingQueuesCacheMu.Lock()
+	if pendingQueuesCache == nil {
 		c, err := lru.New(2)
 		if err != nil {
-			queuedExcessCacheMu.Unlock()
+			pendingQueuesCacheMu.Unlock()
 			return nil, err
 		}
-		queuedExcessCache = c
+		pendingQueuesCache = c
 	}
-	val, found := queuedExcessCache.Get(key)
-	queuedExcessCacheMu.Unlock()
+	val, found := pendingQueuesCache.Get(key)
+	pendingQueuesCacheMu.Unlock()
 	if found {
-		return val.(map[depositKey]int), nil
+		return val.(*pendingQueues), nil
 	}
 
 	res, err := client.PendingDeposits(ctx, &api.PendingDepositsOpts{State: stateID})
 	if err != nil {
 		return nil, fmt.Errorf("error getting pending deposits for state %v: %w", stateID, err)
 	}
-	queued := map[depositKey]int{}
+	queues := &pendingQueues{excess: map[depositKey]int{}, deposits: map[depositKey]int{}, infinityRequests: map[depositKey]int{}, consolidations: map[consolidationKey]int{}}
 	for _, d := range res.Data {
-		if d.Slot != 0 || !d.Signature.IsInfinity() {
+		k := depositKey{Pubkey: d.Pubkey.String(), Amount: d.Amount}
+		queues.deposits[k]++
+		if !d.Signature.IsInfinity() {
 			continue
 		}
-		queued[depositKey{Pubkey: d.Pubkey.String(), Amount: d.Amount}]++
+		if d.Slot == 0 {
+			queues.excess[k]++
+		} else {
+			queues.infinityRequests[k]++
+		}
+	}
+	consolidations, err := client.PendingConsolidations(ctx, &api.PendingConsolidationsOpts{State: stateID})
+	if err != nil {
+		return nil, fmt.Errorf("error getting pending consolidations for state %v: %w", stateID, err)
+	}
+	for _, c := range consolidations.Data {
+		queues.consolidations[consolidationKey{Source: c.SourceIndex, Target: c.TargetIndex}]++
 	}
 
-	queuedExcessCacheMu.Lock()
-	queuedExcessCache.Add(key, queued)
-	queuedExcessCacheMu.Unlock()
-	return queued, nil
+	pendingQueuesCacheMu.Lock()
+	pendingQueuesCache.Add(key, queues)
+	pendingQueuesCacheMu.Unlock()
+	return queues, nil
+}
+
+// The queues of a day's two states and the deposits its blocks add to them check the
+// credits the beaconcha.in API reported for it. Every pending deposit to a validator of
+// the day that was in the start queue or added by a block, and is not in the end queue,
+// was credited during the day: the protocol only postpones a deposit to a validator
+// that is exiting, and such a deposit stays in the queue. The same holds for a
+// consolidation into a validator of the day whose source isn't slashed, which is the
+// only case the protocol drops one without moving its balance. A credit the API doesn't
+// report is one its indexer hasn't processed yet, or one it lost.
+
+// unreportedDeposits returns how often each deposit to a validator of the day was
+// credited without the API reporting it, leaving out the excess, which is accounted
+// from the queues anyway. added holds the deposits the day's blocks queued.
+func unreportedDeposits(start, end *pendingQueues, added, apiDeposits map[depositKey]int, tracked func(depositKey) bool) map[depositKey]int {
+	unreported := map[depositKey]int{}
+	check := func(k depositKey) {
+		credited := start.deposits[k] + added[k] - end.deposits[k]
+		missing := min(credited-apiDeposits[k], credited-max(start.excess[k]-end.excess[k], 0))
+		if missing > 0 && tracked(k) {
+			unreported[k] = missing
+		}
+	}
+	for k := range start.deposits {
+		check(k)
+	}
+	for k := range added {
+		check(k)
+	}
+	return unreported
+}
+
+// unreportedConsolidations returns the consolidations into a validator of the day that
+// were processed without the API reporting them, in a fixed order. The queue doesn't
+// hold the amount a consolidation moves.
+func unreportedConsolidations(start, end *pendingQueues, apiConsolidations map[consolidationKey]int, consolidated func(consolidationKey) bool) []consolidationKey {
+	unreported := []consolidationKey{}
+	for k, n := range start.consolidations {
+		for i := apiConsolidations[k]; i < n-end.consolidations[k] && consolidated(k); i++ {
+			unreported = append(unreported, k)
+		}
+	}
+	sort.Slice(unreported, func(i, j int) bool {
+		if unreported[i].Source != unreported[j].Source {
+			return unreported[i].Source < unreported[j].Source
+		}
+		return unreported[i].Target < unreported[j].Target
+	})
+	return unreported
 }
 
 type BlockData struct {
@@ -336,10 +447,14 @@ type BlockData struct {
 	Transactions  []bellatrix.Transaction
 	BaseFeePerGas *big.Int
 	Deposits      []*phase0.Deposit
-	GasUsed       uint64
-	GasLimit      uint64
-	Withdrawals   []*capella.Withdrawal
-	BlockNumber   uint64
+	// DepositRequests are the deposit requests the block's state transition appends to
+	// the pending deposits queue: those of its own payload from Electra on, those of
+	// its parent's payload from Gloas on.
+	DepositRequests []*electra.DepositRequest
+	GasUsed         uint64
+	GasLimit        uint64
+	Withdrawals     []*capella.Withdrawal
+	BlockNumber     uint64
 	// ExecutionBlockHash is the execution block the beacon block commits to:
 	// its payload's hash before Gloas, its bid's block hash from Gloas on.
 	ExecutionBlockHash phase0.Hash32
@@ -402,6 +517,9 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.Transactions = block.Deneb.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionElectra:
 		d.Deposits = block.Electra.Message.Body.Deposits
+		if requests := block.Electra.Message.Body.ExecutionRequests; requests != nil {
+			d.DepositRequests = requests.Deposits
+		}
 		d.ProposerIndex = block.Electra.Message.ProposerIndex
 		d.GasUsed = block.Electra.Message.Body.ExecutionPayload.GasUsed
 		d.GasLimit = block.Electra.Message.Body.ExecutionPayload.GasLimit
@@ -413,6 +531,9 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		d.Transactions = block.Electra.Message.Body.ExecutionPayload.Transactions
 	case spec.DataVersionFulu:
 		d.Deposits = block.Fulu.Message.Body.Deposits
+		if requests := block.Fulu.Message.Body.ExecutionRequests; requests != nil {
+			d.DepositRequests = requests.Deposits
+		}
 		d.ProposerIndex = block.Fulu.Message.ProposerIndex
 		d.GasUsed = block.Fulu.Message.Body.ExecutionPayload.GasUsed
 		d.GasLimit = block.Fulu.Message.Body.ExecutionPayload.GasLimit
@@ -428,6 +549,9 @@ func GetBlockData(block *spec.VersionedSignedBeaconBlock) (*BlockData, error) {
 		}
 		bid := block.Gloas.Message.Body.SignedExecutionPayloadBid.Message
 		d.Deposits = block.Gloas.Message.Body.Deposits
+		if requests := block.Gloas.Message.Body.ParentExecutionRequests; requests != nil {
+			d.DepositRequests = requests.Deposits
+		}
 		d.ProposerIndex = block.Gloas.Message.ProposerIndex
 		d.ParentRoot = block.Gloas.Message.ParentRoot
 		d.ExecutionBlockHash = bid.BlockHash
@@ -538,7 +662,10 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, err
 	}
 	finalizedSlot := uint64(finalizedHeader.Data.Header.Message.Slot)
-	finalizedDay := finalizedSlot/slotsPerDay - 1
+	finalizedDay, err := lastFinalizedDay(finalizedSlot, slotsPerDay)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	var day uint64
 	if dayStr == "finalized" {
@@ -559,9 +686,6 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	firstSlot := day * slotsPerDay
 	endSlot := (day + 1) * slotsPerDay // first slot not included in this eth.store-day
 
-	if endSlot > finalizedSlot {
-		endSlot = finalizedSlot
-	}
 	lastSlot := endSlot - 1
 
 	firstEpoch := firstSlot / slotsPerEpoch
@@ -594,7 +718,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	// reward, and neither has to change the effective balance. The excess is accounted
 	// from the queues of the two states the balances are read from: entering the queue
 	// during the day as a withdrawal, leaving it as a deposit.
-	var startExcess, endExcess map[depositKey]int
+	var startQueues, endQueues *pendingQueues
 	queueCtx, cancelQueue := context.WithCancel(ctx)
 	defer cancelQueue()
 	queueGroup, queueCtx := errgroup.WithContext(queueCtx)
@@ -602,18 +726,18 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		if electraForkEpoch <= firstEpoch {
 			queueGroup.Go(func() error {
 				var err error
-				startExcess, err = getQueuedExcess(queueCtx, client, fmt.Sprintf("%d", firstSlot))
+				startQueues, err = getPendingQueues(queueCtx, client, fmt.Sprintf("%d", firstSlot))
 				if err != nil {
-					return fmt.Errorf("error getting queued excess for firstSlot %d: %w", firstSlot, err)
+					return fmt.Errorf("error getting pending queues for firstSlot %d: %w", firstSlot, err)
 				}
 				return nil
 			})
 		}
 		queueGroup.Go(func() error {
 			var err error
-			endExcess, err = getQueuedExcess(queueCtx, client, fmt.Sprintf("%d", endSlot))
+			endQueues, err = getPendingQueues(queueCtx, client, fmt.Sprintf("%d", endSlot))
 			if err != nil {
-				return fmt.Errorf("error getting queued excess for endSlot %d: %w", endSlot, err)
+				return fmt.Errorf("error getting pending queues for endSlot %d: %w", endSlot, err)
 			}
 			return nil
 		})
@@ -672,6 +796,15 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	if err := queueGroup.Wait(); err != nil {
 		return nil, nil, err
 	}
+	// the queues don't exist before Electra, and are empty at the start of its fork day
+	if startQueues == nil {
+		startQueues = &pendingQueues{}
+	}
+	hasQueues := endQueues != nil
+	if !hasQueues {
+		endQueues = &pendingQueues{}
+	}
+	startExcess, endExcess := startQueues.excess, endQueues.excess
 	// Excess only enters the queue through a switch to compounding or the Electra fork.
 	// A legacy deposit signed with the point at infinity looks the same in the queue,
 	// but doesn't move its validator's balance until the queue credits it.
@@ -693,6 +826,13 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	// point at infinity like any deposit whose sender chose that signature. Those are
 	// set aside here and told apart once all API calls are done.
 	creditedInfinity := map[depositKey]int{}
+	// every credit the API reports to a validator of the day, to check against the queues
+	apiDeposits := map[depositKey]int{}
+	apiConsolidations := map[consolidationKey]int{}
+	// the deposits the day's blocks append to the queue for a validator of the day, and
+	// those of them that are deposit requests signed with the point at infinity
+	addedDeposits := map[depositKey]int{}
+	addedInfinityRequests := map[depositKey]int{}
 	if GetDebugLevel() > 0 {
 		log.Printf("DEBUG eth.store: startValidators: %v, endValidators: %v, ethstoreValidators: %v", len(startValidators), len(endValidators), len(validatorsByIndex))
 	}
@@ -708,7 +848,8 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		if GetDebugLevel() > 0 {
 			log.Printf("DEBUG eth.store: fetching deposits and consolidation requests (electraForkEpoch: %v)\n", electraForkEpoch)
 		}
-		g.Go(func() error {
+		{
+			// before the blocks, so that a day the API can't account fails fast
 			beaconchainApiGroup := new(errgroup.Group)
 			beaconchainApiGroup.SetLimit(10)
 
@@ -732,6 +873,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 							// only calculate for validators that have been active the whole day
 							continue
 						}
+						apiDeposits[depositKey{Pubkey: d.Pubkey, Amount: phase0.Gwei(d.Amount)}]++
 						if isInfinitySignature(d.Signature) {
 							creditedInfinity[depositKey{Pubkey: d.Pubkey, Amount: phase0.Gwei(d.Amount)}]++
 							continue
@@ -755,6 +897,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 					validatorsMu.Lock()
 					defer validatorsMu.Unlock()
 					for _, d := range consolidationRequests.Data {
+						apiConsolidations[consolidationKey{Source: phase0.ValidatorIndex(d.SourceIndex), Target: phase0.ValidatorIndex(d.TargetIndex)}]++
 						vSource, exists := validatorsByIndex[phase0.ValidatorIndex(d.SourceIndex)]
 						if exists {
 							// only calculate for validators that have been active the whole day
@@ -771,10 +914,33 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			}
 
 			if err := beaconchainApiGroup.Wait(); err != nil {
-				return err
+				return nil, nil, err
 			}
-			return nil
-		})
+		}
+	}
+
+	if hasQueues {
+		consolidated := func(k consolidationKey) bool {
+			_, exists := validatorsByIndex[k.Target]
+			source, known := endValidators[k.Source]
+			return exists && known && !source.Validator.Slashed
+		}
+		unreported := unreportedConsolidations(startQueues, endQueues, apiConsolidations, consolidated)
+		if len(unreported) > 0 && !unreportedConsolidationsFromState.Load() {
+			return nil, nil, fmt.Errorf("%w: day %v: %v consolidations, e.g. of %v into %v", ErrCreditsNotIndexed, day, len(unreported), unreported[0].Source, unreported[0].Target)
+		}
+		for _, k := range unreported {
+			source, known := startValidators[k.Source]
+			if !known {
+				return nil, nil, fmt.Errorf("source %v of an unreported consolidation is not in the state at firstSlot %v", k.Source, firstSlot)
+			}
+			amount := min(source.Balance, source.Validator.EffectiveBalance)
+			log.Printf("WARN eth.store: day %v: the beaconcha.in API doesn't report the consolidation of %v into %v, accounting %v Gwei from the state", day, k.Source, k.Target, amount)
+			validatorsByIndex[k.Target].DepositsSumGwei += amount
+			if vSource, exists := validatorsByIndex[k.Source]; exists {
+				vSource.WithdrawalsSumGwei += amount
+			}
+		}
 	}
 
 	// Get all deposits, withdrawals and txs of all active validators of this day. The two
@@ -876,8 +1042,26 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			defer validatorsMu.Unlock()
 			deposits := blockData.Deposits
 			if blockData.Version >= spec.DataVersionElectra {
-				// a deposit is only queued here and is accounted when the queue credits it
+				// a deposit is only queued here and is accounted when the queue credits it.
+				// One signed with the point at infinity is queued like the excess, and is
+				// left to the excess accounting.
+				for _, d := range deposits {
+					k := depositKey{Pubkey: d.Data.PublicKey.String(), Amount: d.Data.Amount}
+					if _, exists := validatorsByPubkey[k.Pubkey]; exists && !d.Data.Signature.IsInfinity() {
+						addedDeposits[k]++
+					}
+				}
 				deposits = nil
+			}
+			for _, d := range blockData.DepositRequests {
+				k := depositKey{Pubkey: d.Pubkey.String(), Amount: d.Amount}
+				if _, exists := validatorsByPubkey[k.Pubkey]; !exists {
+					continue
+				}
+				addedDeposits[k]++
+				if d.Signature.IsInfinity() {
+					addedInfinityRequests[k]++
+				}
 			}
 			for _, d := range deposits {
 				v, exists := validatorsByPubkey[d.Data.PublicKey.String()]
@@ -909,6 +1093,27 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		return nil, nil, err
 	}
 
+	if hasQueues {
+		tracked := func(k depositKey) bool {
+			_, exists := validatorsByPubkey[k.Pubkey]
+			return exists
+		}
+		unreportedCredits, unreportedGwei := 0, phase0.Gwei(0)
+		for k, n := range unreportedDeposits(startQueues, endQueues, addedDeposits, apiDeposits, tracked) {
+			if GetDebugLevel() > 0 {
+				log.Printf("DEBUG eth.store: unreported credit of %v Gwei to %v (%v times)", k.Amount, k.Pubkey, n)
+			}
+			v := validatorsByPubkey[k.Pubkey]
+			v.DepositsSumGwei += k.Amount * phase0.Gwei(n)
+			v.creditedGwei += k.Amount * phase0.Gwei(n)
+			unreportedCredits += n
+			unreportedGwei += k.Amount * phase0.Gwei(n)
+		}
+		if unreportedCredits > 0 {
+			log.Printf("WARN eth.store: day %v: the beaconcha.in API doesn't report %v credits of %v Gwei in total that the queues and blocks show, accounting them from there", day, unreportedCredits, unreportedGwei)
+		}
+	}
+
 	// An infinity-signed credit beyond the excess the queue credited is a top-up from a
 	// sender who signed with the point at infinity, except for one: the excess of a
 	// validator that may have queued it today and no longer has it queued at the end
@@ -917,30 +1122,41 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	// within 1/128 of the minimum activation balance (0.25 ETH): enough for the rewards
 	// and the partial withdrawals before the switch, too little for a top-up to pass.
 	roundTripTolerance := minActivationBalance / 128
-	roundTrips := map[*Validator]depositKey{}
+	type roundTrip struct {
+		credit   depositKey
+		distance phase0.Gwei
+	}
+	roundTrips := map[*Validator]roundTrip{}
+	infinityCreditedGwei := map[*Validator]phase0.Gwei{}
 	for d, n := range creditedInfinity {
-		v := validatorsByPubkey[d.Pubkey]
-		topUps := n - max(startExcess[d]-endExcess[d], 0)
-		if topUps <= 0 {
-			continue
-		}
-		v.DepositsSumGwei += d.Amount * phase0.Gwei(topUps)
-		distance := excessDistance(v, d.Amount, minActivationBalance)
-		if !v.mayQueueExcess || excessStillQueued[v] || v.StartBalanceGwei+v.creditedGwei <= minActivationBalance || distance > roundTripTolerance {
-			continue
-		}
-		prev, exists := roundTrips[v]
-		if !exists {
-			roundTrips[v] = d
-			continue
-		}
-		// the smaller amount on a tie, so that every run picks the same credit
-		if prevDistance := excessDistance(v, prev.Amount, minActivationBalance); distance < prevDistance || distance == prevDistance && d.Amount < prev.Amount {
-			roundTrips[v] = d
+		if topUps := n - max(startExcess[d]-endExcess[d], 0); topUps > 0 {
+			v := validatorsByPubkey[d.Pubkey]
+			v.DepositsSumGwei += d.Amount * phase0.Gwei(topUps)
+			infinityCreditedGwei[v] += d.Amount * phase0.Gwei(topUps)
 		}
 	}
-	for v, d := range roundTrips {
-		v.DepositsSumGwei -= d.Amount
+	for d, n := range creditedInfinity {
+		v := validatorsByPubkey[d.Pubkey]
+		candidates := n - max(startExcess[d]-endExcess[d], 0)
+		// a deposit request the start queue holds or a block of the day adds is a top-up,
+		// not excess
+		candidates -= max(startQueues.infinityRequests[d]+addedInfinityRequests[d]-endQueues.infinityRequests[d], 0)
+		if candidates <= 0 || !v.mayQueueExcess || excessStillQueued[v] {
+			continue
+		}
+		// what the validator could have had before the switch: every credit but this one
+		credited := v.creditedGwei + infinityCreditedGwei[v] - d.Amount
+		distance := excessDistance(v.StartBalanceGwei, credited, d.Amount, minActivationBalance)
+		if v.StartBalanceGwei+credited <= minActivationBalance || distance > roundTripTolerance {
+			continue
+		}
+		// the closest credit, the smaller amount on a tie, so that every run picks the same
+		if prev, exists := roundTrips[v]; !exists || distance < prev.distance || distance == prev.distance && d.Amount < prev.credit.Amount {
+			roundTrips[v] = roundTrip{credit: d, distance: distance}
+		}
+	}
+	for v, rt := range roundTrips {
+		v.DepositsSumGwei -= rt.credit.Amount
 	}
 
 	if hasGloas {
@@ -980,7 +1196,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 			Day:                  decimal.NewFromInt(int64(day)),
 			DayTime:              startTime,
 			StartEpoch:           decimal.NewFromInt(int64(firstEpoch)),
-			Apr:                  decimal.NewFromInt(365).Mul(validatorRewardsWei).Div(decimal.NewFromInt(int64(v.EffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
+			Apr:                  apr(validatorRewardsWei, v.EffectiveBalanceGwei),
 			Validators:           decimal.NewFromInt(int64(len(validatorsByIndex))),
 			EffectiveBalanceGwei: decimal.NewFromInt(int64(v.EffectiveBalanceGwei)),
 			StartBalanceGwei:     decimal.NewFromInt(int64(v.StartBalanceGwei)),
@@ -993,6 +1209,9 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		}
 	}
 
+	if totalEffectiveBalanceGwei == 0 {
+		return nil, nil, fmt.Errorf("day %v has no validator that was active with an unchanged effective balance all day", day)
+	}
 	totalConsensusRewardsGwei := decimal.NewFromInt(int64(totalEndBalanceGwei) - int64(totalStartBalanceGwei) - int64(totalDepositsSumGwei) + int64(totalWithdrawalsSumGwei))
 	totalRewardsWei := decimal.NewFromBigInt(totalTxFeesSumWei, 0).Add(totalConsensusRewardsGwei.Mul(decimal.NewFromInt(1e9)))
 
@@ -1000,7 +1219,7 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 		Day:                  decimal.NewFromInt(int64(day)),
 		DayTime:              startTime,
 		StartEpoch:           decimal.NewFromInt(int64(firstEpoch)),
-		Apr:                  decimal.NewFromInt(365).Mul(totalRewardsWei).Div(decimal.NewFromInt(int64(totalEffectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9))),
+		Apr:                  apr(totalRewardsWei, totalEffectiveBalanceGwei),
 		Validators:           decimal.NewFromInt(int64(len(validatorsByIndex))),
 		EffectiveBalanceGwei: decimal.NewFromInt(int64(totalEffectiveBalanceGwei)),
 		StartBalanceGwei:     decimal.NewFromInt(int64(totalStartBalanceGwei)),
@@ -1017,6 +1236,14 @@ func Calculate(ctx context.Context, bnAddress, elAddress, dayStr string, concurr
 	}
 
 	return ethstoreDay, ethstorePerValidator, nil
+}
+
+// apr annualises a day's rewards on an effective balance; it is 0 without one.
+func apr(rewardsWei decimal.Decimal, effectiveBalanceGwei phase0.Gwei) decimal.Decimal {
+	if effectiveBalanceGwei == 0 {
+		return decimal.Zero
+	}
+	return decimal.NewFromInt(365).Mul(rewardsWei).Div(decimal.NewFromInt(int64(effectiveBalanceGwei)).Mul(decimal.NewFromInt(1e9)))
 }
 
 // txFeesWei returns the priority fees paid in a block: the fees of its
@@ -1096,27 +1323,23 @@ func requestReceiptsWithRetry(elClient *gethRPC.Client, receiptsMode int, slot u
 
 func batchRequestReceipts(ctx context.Context, elClient *gethRPC.Client, txHashes []common.Hash) ([]*TxReceipt, error) {
 	elems := make([]gethRPC.BatchElem, 0, len(txHashes))
-	errors := make([]error, 0, len(txHashes))
 	txReceipts := make([]*TxReceipt, len(txHashes))
 	for i, h := range txHashes {
 		txReceipt := &TxReceipt{}
-		err := error(nil)
 		elems = append(elems, gethRPC.BatchElem{
 			Method: "eth_getTransactionReceipt",
 			Args:   []interface{}{h.Hex()},
 			Result: txReceipt,
-			Error:  err,
 		})
 		txReceipts[i] = txReceipt
-		errors = append(errors, err)
 	}
 	ioErr := elClient.BatchCallContext(ctx, elems)
 	if ioErr != nil {
 		return nil, fmt.Errorf("io-error when fetching tx-receipts: %w", ioErr)
 	}
-	for _, e := range errors {
-		if e != nil {
-			return nil, fmt.Errorf("error when fetching tx-receipts: %w", e)
+	for i, e := range elems {
+		if e.Error != nil {
+			return nil, fmt.Errorf("error when fetching tx-receipt %v: %w", txHashes[i].Hex(), e.Error)
 		}
 	}
 	return txReceipts, nil
@@ -1324,8 +1547,7 @@ func (c *BeaconchainApiClient) httpReq(ctx context.Context, method, url string, 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	httpClient := &http.Client{Timeout: time.Minute}
-	res, err := httpClient.Do(req)
+	res, err := beaconchainApiHttpClient.Do(req)
 	if err != nil {
 		// res is nil whenever Do reports an error, so it must not be dereferenced.
 		return HttpReqError{Url: url, HTTPError: err}
@@ -1354,7 +1576,11 @@ func (c *BeaconchainApiClient) httpReq(ctx context.Context, method, url string, 
 		log.Printf("DEBUG eth.store: status: 429, limit: %v, remaining: %v, reset: %v, window: %v, remaining-day: %v, remaining-hour: %v, remaining-minute: %v, remaining-month: %v, remaining-second: %v\n", res.Header.Get("ratelimit-limit"), res.Header.Get("ratelimit-remaining"), res.Header.Get("ratelimit-reset"), res.Header.Get("ratelimit-window"), res.Header.Get("x-ratelimit-remaining-day"), res.Header.Get("x-ratelimit-remaining-hour"), res.Header.Get("x-ratelimit-remaining-minute"), res.Header.Get("x-ratelimit-remaining-month"), res.Header.Get("x-ratelimit-remaining-second"))
 	}
 
-	defer res.Body.Close()
+	defer func() {
+		// a connection is only reused once its body was read to the end
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}()
 	if res.StatusCode > 299 {
 		body, _ := io.ReadAll(res.Body)
 		return HttpReqError{StatusCode: res.StatusCode, Url: url, Body: body, RetryAfter: retryAfter}
@@ -1368,16 +1594,75 @@ func (c *BeaconchainApiClient) httpReq(ctx context.Context, method, url string, 
 	return nil
 }
 
+// beaconchainApiHttpClient keeps the connections to the beaconcha.in API open between
+// requests. The default transport keeps 2 per host, so the 10 concurrent requests of a
+// day opened and closed a connection for most of its thousands of requests.
+var beaconchainApiHttpClient = &http.Client{
+	Timeout: time.Minute,
+	Transport: &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	},
+}
+
+// beaconchainApiPageSize is the most rows the beaconcha.in API returns for a slot's
+// requests without an offset.
+const beaconchainApiPageSize = 100
+
+// beaconchainApiMaxPages bounds the pages read for a slot. The API returns up to
+// 100+offset rows from an offset, so the rows read double with every page, and a slot
+// that needs more pages than this is a server that ignores the offset.
+const beaconchainApiMaxPages = 24
+
+// slotRows gets every row of a slot's resource from the beaconcha.in API, a page at a
+// time: a full page may be followed by more rows. The epoch transition behind a slot
+// credits at most 16 deposits, but every pending consolidation whose source becomes
+// withdrawable.
+func slotRows[T any](ctx context.Context, c *BeaconchainApiClient, network string, slot uint64, resource string) ([]T, error) {
+	rows := []T{}
+	for page := 0; ; page++ {
+		url := c.slotUrl(network, slot, resource)
+		if page == beaconchainApiMaxPages {
+			return nil, fmt.Errorf("%v still returns full pages after %v pages and %v rows", url, page, len(rows))
+		}
+		if len(rows) > 0 {
+			url = fmt.Sprintf("%s?offset=%d", url, len(rows))
+		}
+		res := &struct {
+			Status string `json:"status"`
+			Data   []T    `json:"data"`
+		}{}
+		if err := c.HttpReq(ctx, http.MethodGet, url, nil, nil, res); err != nil {
+			return nil, err
+		}
+		if res.Status != "OK" {
+			return nil, fmt.Errorf("unexpected status %q from %v", res.Status, url)
+		}
+		rows = append(rows, res.Data...)
+		if len(res.Data) < beaconchainApiPageSize {
+			return rows, nil
+		}
+	}
+}
+
 func (c *BeaconchainApiClient) ConsolidationRequests(ctx context.Context, network string, slot uint64) (*BeaconchainConsolidationRequestsResponse, error) {
-	res := &BeaconchainConsolidationRequestsResponse{}
-	err := c.HttpReq(ctx, http.MethodGet, c.slotUrl(network, slot, "consolidation_requests"), nil, nil, res)
-	return res, err
+	rows, err := slotRows[BeaconchainConsolidationRequest](ctx, c, network, slot, "consolidation_requests")
+	if err != nil {
+		return nil, err
+	}
+	return &BeaconchainConsolidationRequestsResponse{Status: "OK", Data: rows}, nil
 }
 
 func (c *BeaconchainApiClient) DepositRequests(ctx context.Context, network string, slot uint64) (*BeaconchainDepositRequestsResponse, error) {
-	res := &BeaconchainDepositRequestsResponse{}
-	err := c.HttpReq(ctx, http.MethodGet, c.slotUrl(network, slot, "deposit_requests"), nil, nil, res)
-	return res, err
+	rows, err := slotRows[BeaconchainDepositRequest](ctx, c, network, slot, "deposit_requests")
+	if err != nil {
+		return nil, err
+	}
+	return &BeaconchainDepositRequestsResponse{Status: "OK", Data: rows}, nil
 }
 
 type BeaconchainDepositRequestsResponse struct {

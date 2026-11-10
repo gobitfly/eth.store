@@ -1,6 +1,7 @@
 package ethstore
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -33,6 +34,7 @@ func pendingDeposit(validator uint64, amountGwei uint64, signature string, slot 
 // lastCreditedSlot are the first and the last the day asks the API for.
 const (
 	creditedSlot      = gloasTestFirstSlot + 10*32 - 1
+	requestSlot       = gloasTestFirstSlot + 5
 	firstCreditedSlot = gloasTestFirstSlot + 32 - 1
 	lastCreditedSlot  = gloasTestEndSlot - 1
 )
@@ -41,6 +43,17 @@ const (
 // queue credits it.
 func apiDeposit(validator uint64, amountGwei uint64, signature string) map[string]any {
 	return apiDepositOf(fmt.Sprintf("%#096x", validator), amountGwei, signature)
+}
+
+// depositRequest is a deposit request to a validator in a block.
+func depositRequest(validator uint64, amountGwei uint64, signature string) map[string]any {
+	return map[string]any{
+		"pubkey":                 fmt.Sprintf("%#096x", validator),
+		"withdrawal_credentials": "0x" + strings.Repeat("00", 32),
+		"amount":                 fmt.Sprintf("%d", amountGwei),
+		"signature":              signature,
+		"index":                  "1",
+	}
 }
 
 func apiDepositOf(pubkey string, amountGwei uint64, signature string) map[string]any {
@@ -121,6 +134,7 @@ func TestEthstoreQueuedExcess(t *testing.T) {
 		scenario        gloasDayScenario
 		wantDeposits    int64
 		wantWithdrawals int64
+		wantErr         error
 	}{
 		{
 			name: "switch to compounding queues the excess",
@@ -148,6 +162,162 @@ func TestEthstoreQueuedExcess(t *testing.T) {
 				startQueue:  []pendingDepositJson{pendingDeposit(4, excess, excessSignature, 0)},
 			},
 			wantDeposits: excess,
+		},
+		{
+			name: "queued top-up credited",
+			scenario: gloasDayScenario{
+				endBalances: map[uint64]uint64{4: 32e9 + topUp + 3200000},
+				startQueue:  []pendingDepositJson{pendingDeposit(4, topUp, realSignature, gloasTestFirstSlot-100)},
+				apiDeposits: map[uint64][]map[string]any{creditedSlot: {apiDeposit(4, topUp, realSignature)}},
+			},
+			wantDeposits: topUp,
+		},
+		{
+			// the queues show the credit, which would otherwise be a reward
+			name: "queued top-up credited, missing from the API",
+			scenario: gloasDayScenario{
+				endBalances: map[uint64]uint64{4: 32e9 + topUp + 3200000},
+				startQueue:  []pendingDepositJson{pendingDeposit(4, topUp, realSignature, gloasTestFirstSlot-100)},
+			},
+			wantDeposits: topUp,
+		},
+		{
+			// it counts towards the balance a switch could queue
+			name: "queued top-up missing from the API before a same-day round trip",
+			scenario: gloasDayScenario{
+				switched:      map[uint64]bool{4: true},
+				startBalances: map[uint64]uint64{4: 32e9 - excess/10},
+				endBalances:   map[uint64]uint64{4: 32e9 - excess/10 + topUp + 3200000},
+				startQueue:    []pendingDepositJson{pendingDeposit(4, topUp, realSignature, gloasTestFirstSlot-100)},
+				apiDeposits:   map[uint64][]map[string]any{creditedSlot: {apiDeposit(4, topUp-excess/10, excessSignature)}},
+			},
+			wantDeposits: topUp,
+		},
+		{
+			// a short queue credits a top-up the day its block requests it
+			name: "top-up requested and credited the same day",
+			scenario: gloasDayScenario{
+				endBalances:     map[uint64]uint64{4: 32e9 + topUp + 3200000},
+				depositRequests: map[uint64][]map[string]any{requestSlot: {depositRequest(4, topUp, realSignature)}},
+				apiDeposits:     map[uint64][]map[string]any{creditedSlot: {apiDeposit(4, topUp, realSignature)}},
+			},
+			wantDeposits: topUp,
+		},
+		{
+			// neither queue shows it, only the block that requested it
+			name: "top-up requested and credited the same day, missing from the API",
+			scenario: gloasDayScenario{
+				endBalances:     map[uint64]uint64{4: 32e9 + topUp + 3200000},
+				depositRequests: map[uint64][]map[string]any{requestSlot: {depositRequest(4, topUp, realSignature)}},
+			},
+			wantDeposits: topUp,
+		},
+		{
+			name: "top-up requested and still queued",
+			scenario: gloasDayScenario{
+				depositRequests: map[uint64][]map[string]any{requestSlot: {depositRequest(4, topUp, realSignature)}},
+				endQueue:        []pendingDepositJson{pendingDeposit(4, topUp, realSignature, requestSlot)},
+			},
+		},
+		{
+			// the block at firstSlot is part of the start state, the one at endSlot of the end state
+			name: "top-ups requested at the day's first and end slot",
+			scenario: gloasDayScenario{
+				endBalances: map[uint64]uint64{4: 32e9 + topUp + 3200000},
+				depositRequests: map[uint64][]map[string]any{
+					gloasTestFirstSlot: {depositRequest(4, topUp, realSignature)},
+					gloasTestEndSlot:   {depositRequest(4, 2*topUp, realSignature)},
+				},
+				startQueue: []pendingDepositJson{pendingDeposit(4, topUp, realSignature, gloasTestFirstSlot)},
+				endQueue:   []pendingDepositJson{pendingDeposit(4, 2*topUp, realSignature, gloasTestEndSlot)},
+			},
+			wantDeposits: topUp,
+		},
+		{
+			// the API's indexer missed the round trip; the block shows the credit was a
+			// deposit request, so it can't be the excess
+			name: "top-up signed with the point at infinity requested the same day next to a round trip missing from the API",
+			scenario: gloasDayScenario{
+				switched:        map[uint64]bool{4: true},
+				startBalances:   map[uint64]uint64{4: 32e9 + excess},
+				endBalances:     map[uint64]uint64{4: 32e9 + excess + excess + excess/10 + 3200000},
+				depositRequests: map[uint64][]map[string]any{requestSlot: {depositRequest(4, excess+excess/10, excessSignature)}},
+				apiDeposits:     map[uint64][]map[string]any{creditedSlot: {apiDeposit(4, excess+excess/10, excessSignature)}},
+			},
+			wantDeposits: excess + excess/10,
+		},
+		{
+			name: "queued top-up postponed",
+			scenario: gloasDayScenario{
+				startQueue: []pendingDepositJson{pendingDeposit(4, topUp, realSignature, gloasTestFirstSlot-100)},
+				endQueue:   []pendingDepositJson{pendingDeposit(4, topUp, realSignature, gloasTestFirstSlot-100)},
+			},
+		},
+		{
+			name: "queued deposit to a validator outside the day credited, missing from the API",
+			scenario: gloasDayScenario{
+				startQueue: []pendingDepositJson{pendingDeposit(gloasTestValis+1, topUp, realSignature, gloasTestFirstSlot-100)},
+			},
+		},
+		{
+			// the API's rows of a slot come in pages
+			name: "more credits in an epoch than one page of the API",
+			scenario: gloasDayScenario{
+				endBalances: map[uint64]uint64{6: 32e9 + 250 + 3200000},
+				apiDeposits: map[uint64][]map[string]any{creditedSlot: manyApiDeposits(6, 250, realSignature)},
+			},
+			wantDeposits: 250,
+		},
+		{
+			// the switch comes after the top-up lifted the balance above 32 ETH
+			name: "same-day round trip after a top-up signed with the point at infinity",
+			scenario: gloasDayScenario{
+				switched:      map[uint64]bool{4: true},
+				startBalances: map[uint64]uint64{4: 32e9 - excess/10},
+				endBalances:   map[uint64]uint64{4: 32e9 - excess/10 + topUp + 3200000},
+				apiDeposits: map[uint64][]map[string]any{
+					firstCreditedSlot: {apiDeposit(4, topUp, excessSignature)},
+					creditedSlot:      {apiDeposit(4, topUp-excess/10, excessSignature)},
+				},
+			},
+			wantDeposits: topUp,
+		},
+		{
+			// the API's indexer missed the round trip; the start queue shows the top-up
+			// was a deposit request, so it can't be the excess
+			name: "queued top-up signed with the point at infinity next to a round trip missing from the API",
+			scenario: gloasDayScenario{
+				switched:      map[uint64]bool{4: true},
+				startBalances: map[uint64]uint64{4: 32e9 + excess},
+				endBalances:   map[uint64]uint64{4: 32e9 + excess + excess + excess/10 + 3200000},
+				startQueue:    []pendingDepositJson{pendingDeposit(4, excess+excess/10, excessSignature, gloasTestFirstSlot-100)},
+				apiDeposits:   map[uint64][]map[string]any{creditedSlot: {apiDeposit(4, excess+excess/10, excessSignature)}},
+			},
+			wantDeposits: excess + excess/10,
+		},
+		{
+			name: "top-up signed with the point at infinity beyond the tolerance of the excess",
+			scenario: gloasDayScenario{
+				switched:      map[uint64]bool{4: true},
+				startBalances: map[uint64]uint64{4: 32e9 + excess},
+				endBalances:   map[uint64]uint64{4: 32e9 + excess + excess + 3*excess/10 + 3200000},
+				apiDeposits:   map[uint64][]map[string]any{creditedSlot: {apiDeposit(4, excess+3*excess/10, excessSignature)}},
+			},
+			wantDeposits: excess + 3*excess/10,
+		},
+		{
+			// the closest credit is the round trip, whatever the order
+			name: "same-day round trip and a top-up signed with the point at infinity just inside the tolerance",
+			scenario: gloasDayScenario{
+				switched:      map[uint64]bool{4: true},
+				startBalances: map[uint64]uint64{4: 32e9 + excess},
+				endBalances:   map[uint64]uint64{4: 32e9 + excess + excess + excess/5 + 3200000},
+				apiDeposits: map[uint64][]map[string]any{
+					firstCreditedSlot: {apiDeposit(4, excess+excess/5, excessSignature)},
+					creditedSlot:      {apiDeposit(4, excess, excessSignature)},
+				},
+			},
+			wantDeposits: excess + excess/5,
 		},
 		{
 			// neither state shows the excess, only the API's credit does
@@ -338,28 +508,50 @@ func TestEthstoreQueuedExcess(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tt.scenario.forkSlot = forkSlot
-			tt.scenario.finalizedSlot = finalized
-			res, validators, _, err := runGloasDay(t, tt.scenario, RECEIPTS_MODE_BATCH)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if want := decimal.NewFromInt(gloasTestValis * 3200000); !res.ConsensusRewardsGwei.Equal(want) {
-				t.Errorf("ConsensusRewardsGwei: got %v, want %v", res.ConsensusRewardsGwei, want)
-			}
-			for index, v := range validators {
-				if want := decimal.NewFromInt(3200000); !v.ConsensusRewardsGwei.Equal(want) {
-					t.Errorf("validator %d ConsensusRewardsGwei: got %v, want %v", index, v.ConsensusRewardsGwei, want)
-				}
-			}
-			if want := decimal.NewFromInt(tt.wantDeposits); !res.DepositsSumGwei.Equal(want) {
-				t.Errorf("DepositsSumGwei: got %v, want %v", res.DepositsSumGwei, want)
-			}
-			if want := decimal.NewFromInt(tt.wantWithdrawals); !res.WithdrawalsSumGwei.Equal(want) {
-				t.Errorf("WithdrawalsSumGwei: got %v, want %v", res.WithdrawalsSumGwei, want)
-			}
-		})
+		for _, mode := range []int{RECEIPTS_MODE_BATCH, RECEIPTS_MODE_SINGLE} {
+			t.Run(fmt.Sprintf("%s/receipts mode %d", tt.name, mode), func(t *testing.T) {
+				testQueuedExcessDay(t, tt.scenario, forkSlot, finalized, mode, tt.wantDeposits, tt.wantWithdrawals, tt.wantErr)
+			})
+		}
+	}
+}
+
+// manyApiDeposits returns n credits of 1 Gwei to a validator as the beaconcha.in API reports them.
+func manyApiDeposits(validator uint64, n int, signature string) []map[string]any {
+	deposits := []map[string]any{}
+	for i := 0; i < n; i++ {
+		deposits = append(deposits, apiDeposit(validator, 1, signature))
+	}
+	return deposits
+}
+
+func testQueuedExcessDay(t *testing.T, scenario gloasDayScenario, forkSlot, finalized uint64, mode int, wantDeposits, wantWithdrawals int64, wantErr error) {
+	t.Helper()
+	scenario.forkSlot = forkSlot
+	scenario.finalizedSlot = finalized
+	res, validators, _, err := runGloasDay(t, scenario, mode)
+	if wantErr != nil {
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("got error %v, want %v", err, wantErr)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := decimal.NewFromInt(gloasTestValis * 3200000); !res.ConsensusRewardsGwei.Equal(want) {
+		t.Errorf("ConsensusRewardsGwei: got %v, want %v", res.ConsensusRewardsGwei, want)
+	}
+	for index, v := range validators {
+		if want := decimal.NewFromInt(3200000); !v.ConsensusRewardsGwei.Equal(want) {
+			t.Errorf("validator %d ConsensusRewardsGwei: got %v, want %v", index, v.ConsensusRewardsGwei, want)
+		}
+	}
+	if want := decimal.NewFromInt(wantDeposits); !res.DepositsSumGwei.Equal(want) {
+		t.Errorf("DepositsSumGwei: got %v, want %v", res.DepositsSumGwei, want)
+	}
+	if want := decimal.NewFromInt(wantWithdrawals); !res.WithdrawalsSumGwei.Equal(want) {
+		t.Errorf("WithdrawalsSumGwei: got %v, want %v", res.WithdrawalsSumGwei, want)
 	}
 }
 
